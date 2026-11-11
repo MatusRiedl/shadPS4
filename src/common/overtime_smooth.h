@@ -5,6 +5,7 @@
 //   OVERTIME_SMOOTH_PRIORITY  process above normal, power throttling off, GPU/present threads highest
 //   OVERTIME_SMOOTH_FLIP      present a finished frame at once instead of at the next vblank tick
 //                             (at most one per vblank period, so the frame cap stays the vblank rate)
+//   OVERTIME_SMOOTH_SPIN      GPU command thread: no locking of empty queues, pause backoff while it only waits
 
 #pragma once
 
@@ -24,6 +25,13 @@ inline bool SmoothPriority() {
 
 inline bool SmoothFlip() {
     static const bool on = SwitchOn("OVERTIME_SMOOTH_FLIP");
+    return on;
+}
+
+// OVERTIME_SMOOTH_SPIN: the GPU command thread skips empty queues without locking and backs off (pause, then yield)
+// while every queue only waits on guest memory, instead of re-locking the queues in a tight loop.
+inline bool SmoothSpin() {
+    static const bool on = SwitchOn("OVERTIME_SMOOTH_SPIN");
     return on;
 }
 

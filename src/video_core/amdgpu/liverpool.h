@@ -192,8 +192,8 @@ private:
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
-    void ProcessCommands();
-    void ProcessCeQueue();
+    bool ProcessCommands();
+    bool ProcessCeQueue();
     void Process(std::stop_token stoken);
     void HandleGetLodStats(const PM4CmdGetLodStats* get_lod);
 
@@ -204,10 +204,12 @@ private:
         std::vector<u32> dcb_buffer;
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
+        std::atomic<u32> pending{}; // submits.size(), readable without m_access
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     std::queue<Task::Handle> ce_submits;
+    std::atomic<u32> ce_pending{}; // ce_submits.size(), readable without the lock
     u32 num_mapped_queues{1u}; // GFX is always available
 
     VAddr indirect_args_addr{};
@@ -231,6 +233,7 @@ private:
     const bool guest_markers_enabled;
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
+    u64 gpu_progress{}; // packets started; GPU command thread only (Overtime spin backoff)
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;

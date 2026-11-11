@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <boost/preprocessor/stringize.hpp>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -87,30 +91,39 @@ Liverpool::~Liverpool() {
     }
 }
 
-void Liverpool::ProcessCeQueue() {
+bool Liverpool::ProcessCeQueue() {
     auto& queue = mapped_queues[GfxQueueId];
+    if (Overtime::SmoothSpin() && ce_pending.load(std::memory_order_acquire) == 0) {
+        return false;
+    }
     Task::Handle task{};
     {
         std::scoped_lock lock{queue.m_access};
         if (ce_submits.empty()) {
-            return;
+            return false;
         }
         task = ce_submits.front();
     }
+    const u64 before = gpu_progress;
     task.resume();
     if (task.done()) {
         task.destroy();
         std::scoped_lock lock{queue.m_access};
         ce_submits.pop();
+        ce_pending.fetch_sub(1, std::memory_order_release);
         --num_submits;
         std::scoped_lock lock2{submit_mutex};
         submit_cv.notify_all();
+        return true;
     }
+    return gpu_progress != before;
 }
 
-void Liverpool::ProcessCommands() {
+bool Liverpool::ProcessCommands() {
     // Process incoming commands with high priority
+    bool ran = false;
     while (num_commands) {
+        ran = true;
         Common::UniqueFunction<void> callback{};
         {
             std::scoped_lock lk{submit_mutex};
@@ -120,6 +133,7 @@ void Liverpool::ProcessCommands() {
         }
         callback();
     }
+    return ran;
 }
 
 void Liverpool::Process(std::stop_token stoken) {
@@ -131,6 +145,7 @@ void Liverpool::Process(std::stop_token stoken) {
 #ifdef __linux__
     gpu_tid = gettid();
 #endif
+    const bool smooth_spin = Overtime::SmoothSpin();
 
     while (!stoken.stop_requested()) {
         {
@@ -145,34 +160,56 @@ void Liverpool::Process(std::stop_token stoken) {
         VideoCore::StartCapture();
 
         curr_qid = -1;
+        u32 idle_passes = 0;
 
         while ((num_submits || num_commands) && !stoken.stop_requested()) {
-            ProcessCommands();
-            ProcessCeQueue();
+            bool progress = ProcessCommands();
+            progress |= ProcessCeQueue();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
 
             auto& queue = mapped_queues[curr_qid];
 
             Task::Handle task{};
-            {
+            if (!smooth_spin || queue.pending.load(std::memory_order_acquire) != 0) {
                 std::scoped_lock lock{queue.m_access};
-                if (queue.submits.empty()) {
-                    continue;
+                if (!queue.submits.empty()) {
+                    task = queue.submits.front();
                 }
-                task = queue.submits.front();
             }
-            task.resume();
+            if (task) {
+                const u64 before = gpu_progress;
+                task.resume();
+                progress |= gpu_progress != before;
 
-            if (task.done()) {
-                task.destroy();
+                if (task.done()) {
+                    task.destroy();
+                    progress = true;
 
-                std::scoped_lock lock{queue.m_access};
-                queue.submits.pop();
+                    std::scoped_lock lock{queue.m_access};
+                    queue.submits.pop();
+                    queue.pending.fetch_sub(1, std::memory_order_release);
 
-                --num_submits;
-                std::scoped_lock lock2{submit_mutex};
-                submit_cv.notify_all();
+                    --num_submits;
+                    std::scoped_lock lock2{submit_mutex};
+                    submit_cv.notify_all();
+                }
+            }
+
+            if (!smooth_spin) {
+                continue;
+            }
+            // Overtime: every queue only re-polled a wait (no packet started, nothing finished) for a full round.
+            // Back off with pause instructions, growing up to ~128 per pass, instead of re-locking at full speed.
+            if (progress) {
+                idle_passes = 0;
+            } else if (++idle_passes > num_mapped_queues) {
+                const u32 rounds = std::min<u32>((idle_passes - num_mapped_queues) / num_mapped_queues, 7);
+                for (u32 i = 0; i < (1u << rounds); ++i) {
+#if defined(_M_X64) || defined(__x86_64__)
+                    _mm_pause();
+#endif
+                }
             }
         }
 
@@ -193,6 +230,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_ENTER(ccb_task_name);
 
     while (!ccb.empty()) {
+        ++gpu_progress;
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(ccb.data());
@@ -281,6 +319,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
 
     auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
+        ++gpu_progress;
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
@@ -990,6 +1029,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
+        ++gpu_progress;
         ProcessCommands();
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
@@ -1312,9 +1352,11 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         std::scoped_lock lock{submit_mutex, queue.m_access};
         if (!ccb.empty()) {
             ce_submits.emplace(ProcessCeUpdate(ccb).handle);
+            ce_pending.fetch_add(1, std::memory_order_release);
             ++num_submits;
         }
         queue.submits.emplace(task.handle);
+        queue.pending.fetch_add(1, std::memory_order_release);
         ++num_submits;
         submit_cv.notify_one();
     }
@@ -1329,6 +1371,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        queue.pending.fetch_add(1, std::memory_order_release);
     }
 
     std::scoped_lock lk{submit_mutex};
