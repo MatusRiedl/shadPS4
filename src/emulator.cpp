@@ -14,6 +14,7 @@
 
 #include "common/debug.h"
 #include "common/logging/log.h"
+#include "common/overtime_smooth.h"
 #include "common/string_util.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
@@ -292,6 +293,19 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                    std::vector<std::pair<std::filesystem::path, std::string>> mounts,
                    std::vector<std::string> const& env_vars, bool append_log) {
     Common::SetCurrentThreadName("shadPS4:Main");
+#ifdef _WIN32
+    if (Overtime::SmoothPriority()) {
+        // Overtime lab: above normal class and no power throttling (EcoQoS), as the native port does
+        SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+        PROCESS_POWER_THROTTLING_STATE throttling{};
+        throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+                                 PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        throttling.StateMask = 0;
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling,
+                              sizeof(throttling));
+    }
+#endif
     if (waitForDebuggerBeforeRun) {
         Debugger::WaitForDebuggerAttach();
     }

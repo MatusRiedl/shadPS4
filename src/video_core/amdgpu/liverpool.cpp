@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/overtime_smooth.h"
 #include "common/polyfill_thread.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
@@ -123,6 +124,9 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    if (Overtime::SmoothPriority()) {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
+    }
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();

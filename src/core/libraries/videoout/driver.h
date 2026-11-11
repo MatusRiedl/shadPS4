@@ -112,8 +112,10 @@ private:
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
     void PresentThread(std::stop_token token);
+    void PresentThreadSmooth(std::stop_token token); // Overtime lab: early flip, precise ticks
 
     std::mutex mutex;
+    std::condition_variable requests_cv;
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;

@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include <chrono>
+#include <condition_variable>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "common/debug.h"
+#include "common/overtime_smooth.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -45,7 +51,13 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     main_port.resolution.full_height = height;
     main_port.resolution.pane_width = width;
     main_port.resolution.pane_height = height;
-    present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
+    present_thread = std::jthread([&](std::stop_token token) {
+        if (Overtime::SmoothFlip() || Overtime::SmoothPriority()) {
+            PresentThreadSmooth(token);
+        } else {
+            PresentThread(token);
+        }
+    });
 }
 
 VideoOutDriver::~VideoOutDriver() = default;
@@ -332,14 +344,17 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
-    std::scoped_lock lock{mutex};
-    requests.push({
-        .frame = frame,
-        .port = port,
-        .flip_arg = flip_arg,
-        .index = index,
-        .eop = is_eop,
-    });
+    {
+        std::scoped_lock lock{mutex};
+        requests.push({
+            .frame = frame,
+            .port = port,
+            .flip_arg = flip_arg,
+            .index = index,
+            .eop = is_eop,
+        });
+    }
+    requests_cv.notify_one();
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -413,6 +428,144 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
 
         timer.End();
+    }
+}
+
+void VideoOutDriver::PresentThreadSmooth(std::stop_token token) {
+    using Clock = std::chrono::steady_clock;
+    using namespace std::chrono_literals;
+    const std::chrono::nanoseconds vblank_period(1000000000 /
+                                                 EmulatorSettings.GetVblankFrequency());
+    const bool spin_tail = vblank_period >= 2ms; // at 9999 Hz the period is 100 us: plain sleeps
+    const bool early_flip = Overtime::SmoothFlip();
+
+    Common::SetCurrentThreadName("shadPS4:PresentThread");
+    if (Overtime::SmoothPriority()) {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
+    }
+    LOG_INFO(Lib_VideoOut, "Overtime present loop: period {} ns, early flip {}, priority {}",
+             vblank_period.count(), early_flip, Overtime::SmoothPriority());
+
+    const auto pop_request = [this]() -> Request {
+        if (!requests.empty()) {
+            const auto request = requests.front();
+            requests.pop();
+            return request;
+        }
+        return {};
+    };
+
+    auto next_tick = Clock::now() + vblank_period;
+    auto last_idle_draw = Clock::now();
+    u64 flipped_in = ~0ULL; // vblank count of the period that already had an early flip
+
+    while (!token.stop_requested()) {
+        auto& vblank_status = main_port.vblank_status;
+
+        // Until the tick: show a finished frame at once (flip rate 0 only, one per period).
+        while (!token.stop_requested()) {
+            const auto now = Clock::now();
+            if (now >= next_tick) {
+                break;
+            }
+            const auto remaining = next_tick - now;
+            const bool may_flip = early_flip && !DebugState.IsGuestThreadsPaused() &&
+                                  main_port.flip_rate == 0 && flipped_in != vblank_status.count;
+            if (may_flip) {
+                Request request{};
+                {
+                    std::unique_lock lk{mutex};
+                    if (requests.empty() && remaining > 1500us) {
+                        requests_cv.wait_for(lk, remaining - 1500us, [&] {
+                            return !requests.empty() || token.stop_requested();
+                        });
+                    }
+                    request = pop_request();
+                }
+                if (request) {
+                    Flip(request);
+                    FRAME_END;
+                    flipped_in = vblank_status.count;
+                    continue;
+                }
+                if (next_tick - Clock::now() > 1500us) {
+                    continue;
+                }
+            } else if (remaining > 1500us) {
+                Common::AccurateSleep(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(remaining - 1000us),
+                    nullptr, false);
+                continue;
+            }
+            // Last stretch before the tick: high-res sleep, then spin the final 200 us.
+            const auto left = next_tick - Clock::now();
+            if (!spin_tail) {
+                if (left > 0ns) {
+                    Common::AccurateSleep(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(left), nullptr,
+                        false);
+                }
+                break;
+            }
+            if (left > 250us) {
+                Common::AccurateSleep(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(left - 200us), nullptr,
+                    false);
+            }
+            while (Clock::now() < next_tick) {
+                YieldProcessor();
+            }
+            break;
+        }
+
+        // The tick.
+        if (DebugState.IsGuestThreadsPaused()) {
+            DrawLastFrame();
+        } else if (vblank_status.count % (main_port.flip_rate + 1) == 0 &&
+                   flipped_in != vblank_status.count) {
+            Request request{};
+            {
+                std::scoped_lock lk{mutex};
+                request = pop_request();
+            }
+            if (request) {
+                Flip(request);
+                FRAME_END;
+            } else if (Clock::now() - last_idle_draw >= 16ms) { // don't draw idle frames too fast
+                last_idle_draw = Clock::now();
+                if (!main_port.is_open) {
+                    DrawBlankFrame();
+                } else if (ImGui::Core::MustKeepDrawing()) {
+                    DrawLastFrame();
+                }
+            }
+        }
+
+        {
+            // Needs lock here as can be concurrently read by `sceVideoOutGetVblankStatus`
+            std::scoped_lock lock{main_port.vo_mutex};
+            for (auto event : main_port.vblank_events) {
+                auto equeue = Kernel::GetEqueue(event);
+                if (equeue != nullptr) {
+                    equeue->TriggerEvent(
+                        static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
+                        Kernel::OrbisKernelEvent::Filter::VideoOut,
+                        reinterpret_cast<void*>(
+                            static_cast<u64>(OrbisVideoOutInternalEventId::Vblank) |
+                            (vblank_status.count << 16)));
+                }
+            }
+            vblank_status.count++;
+            vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
+            vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
+            main_port.vblank_cv.notify_all();
+        }
+
+        next_tick += vblank_period;
+        const auto now = Clock::now();
+        if (now > next_tick + vblank_period) { // fell far behind (debugger, stall): resync
+            next_tick = now + vblank_period;
+        }
     }
 }
 
