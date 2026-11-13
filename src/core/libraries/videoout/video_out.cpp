@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "common/overtime_switch.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/userservice.h"
@@ -363,7 +364,16 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
-            ASSERT_MSG(port->buffer_labels[buf_id] == 1, "Out of order flip IRQ");
+            if (port->buffer_labels[buf_id] != 1) {
+                // The present thread resets the previous buffer's label when it shows the next
+                // frame; if the guest re-locked that buffer meanwhile, the reset lands between the
+                // CP's label write and this check. The frame copy (PrepareFrame) is recorded on
+                // the draw scheduler in command order, so flipping anyway shows the right image.
+                static const bool tolerant = Overtime::SwitchOn("OVERTIME_FLIP_TOLERANT");
+                ASSERT_MSG(tolerant, "Out of order flip IRQ");
+                LOG_WARNING(Lib_VideoOut, "Out of order flip IRQ (buffer {}, label {}), flipping",
+                            buf_id, port->buffer_labels[buf_id]);
+            }
             const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true);
             ASSERT_MSG(result, "EOP flip submission failed");
         });

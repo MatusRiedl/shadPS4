@@ -4,6 +4,8 @@
 // Overtime switches. Each is on unless its environment variable is "0":
 //   OVERTIME_LAZY_COMMIT  (Windows) guest memory backing reserved, committed range by range when
 //                         first mapped, instead of the whole backing committed at start
+//   OVERTIME_FLIP_TOLERANT  a flip IRQ whose buffer label was already reset logs a warning and
+//                         flips, instead of the "Out of order flip IRQ" assert (crash)
 
 #pragma once
 
