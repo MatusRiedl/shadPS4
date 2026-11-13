@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -438,6 +439,11 @@ private:
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
     u64 registry_generation = 1;
+    // Overtime (OVERTIME_GC_SECONDS): gc_tick at the start of each of the last 64 seconds, for
+    // collector ages in seconds, and the second until which VRAM counts as short.
+    std::array<u64, 64> gc_tick_at_second{};
+    u64 gc_second = 0;
+    u64 vram_short_until = 0;
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;
     const bool readback_linear_images;
