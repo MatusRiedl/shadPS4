@@ -7,14 +7,17 @@
 #include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_video.h>
+#include <chrono>
 #include <cmrc/cmrc.hpp>
 #include <stb_image.h>
 
+#include "common/overtime_switch.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/logging/formatter.h"
 #include "common/scope_exit.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
@@ -340,6 +343,35 @@ void WindowSDL::WaitEvent() {
 }
 
 void WindowSDL::InitTimers() {
+    if (Overtime::SwitchOn("OVERTIME_POLL_THREAD")) {
+        // SDL's timer thread spins through the last millisecond before each tick (its Windows
+        // semaphore wait truncates the timeout to whole ms, 0 = return at once): with 4 ms
+        // controller timers that cost ~0.12 of a core. Same polling from a thread that sleeps
+        // to absolute 4 ms deadlines; the mouse every 8th tick (32 ms, was 33).
+        poll_thread = std::jthread([this](std::stop_token token) {
+            using namespace std::chrono_literals;
+            Common::SetCurrentThreadName("Overtime:InputPoll");
+            auto next = std::chrono::steady_clock::now();
+            for (u32 tick = 0; !token.stop_requested(); ++tick) {
+                for (int i = 0; i < 4; ++i) {
+                    controllers[i]->PollState();
+                }
+                if (tick % 8 == 0) {
+                    Input::MousePolling(controllers[0], 0, 33);
+                }
+                next += 4ms;
+                const auto now = std::chrono::steady_clock::now();
+                if (now > next + 100ms) { // fell far behind (debugger): resync
+                    next = now;
+                }
+                // high resolution waitable timer: a plain sleep can round up to 15.6 ms
+                Common::AccurateSleep(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          next - std::chrono::steady_clock::now()),
+                                      nullptr, false);
+            }
+        });
+        return;
+    }
     for (int i = 0; i < 4; ++i) {
         SDL_AddTimer(4, &PollController, controllers[i]);
     }

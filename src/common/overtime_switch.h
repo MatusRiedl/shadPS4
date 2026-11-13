@@ -6,6 +6,8 @@
 //                         first mapped, instead of the whole backing committed at start
 //   OVERTIME_FLIP_TOLERANT  a flip IRQ whose buffer label was already reset logs a warning and
 //                         flips, instead of the "Out of order flip IRQ" assert (crash)
+//   OVERTIME_POLL_THREAD  controllers (4 ms) and mouse (32 ms) polled from a sleeping thread
+//                         instead of SDL timers (SDL's timer thread spins before each tick)
 
 #pragma once
 
