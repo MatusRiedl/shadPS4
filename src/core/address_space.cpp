@@ -10,6 +10,8 @@
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/error.h"
+#include "common/logging/log.h"
+#include "common/overtime_switch.h"
 #include "core/address_space.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/memory.h"
@@ -197,9 +199,16 @@ struct AddressSpace::Impl {
                        EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
 
         // Allocate backing file that represents the total physical memory.
+        // Overtime: with lazy commit (OVERTIME_LAZY_COMMIT, default on) the section is only reserved
+        // and each physical range is committed when it is first mapped (CommitBacking), so the
+        // system commit charge follows the memory the game maps instead of the whole
+        // 7.9 GB + flexible + extra dmem at start.
+        lazy_commit = Overtime::SwitchOn("OVERTIME_LAZY_COMMIT");
         backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
-                                            PAGE_EXECUTE_READWRITE, SEC_COMMIT, BackingSize,
+                                            PAGE_EXECUTE_READWRITE,
+                                            lazy_commit ? SEC_RESERVE : SEC_COMMIT, BackingSize,
                                             nullptr, nullptr, 0);
+        LOG_INFO(Core, "Backing memory {} MB, lazy commit {}", BackingSize / 1_MB, lazy_commit);
 
         ASSERT_MSG(backing_handle, "{}", Common::GetLastErrorMsg());
         // Allocate a virtual memory for the backing file map as placeholder
@@ -232,6 +241,21 @@ struct AddressSpace::Impl {
         if (!CloseHandle(backing_handle)) {
             LOG_CRITICAL(Core, "Failed to free backing memory file handle");
         }
+    }
+
+    // Commits the backing pages of [phys_addr, phys_addr + size) (lazy commit only). Committing
+    // through the backing view commits the section pages for every view of them; already committed
+    // pages stay as they are.
+    void CommitBacking(PAddr phys_addr, u64 size) {
+        if (!lazy_commit || size == 0) {
+            return;
+        }
+        const u64 begin = Common::AlignDown(phys_addr, 4_KB);
+        const u64 end = Common::AlignUp(phys_addr + size, 4_KB);
+        void* ret = VirtualAlloc(backing_base + begin, end - begin, MEM_COMMIT,
+                                 PAGE_EXECUTE_READWRITE);
+        ASSERT_MSG(ret, "Failed to commit backing memory {:#x}+{:#x}: {}", begin, end - begin,
+                   Common::GetLastErrorMsg());
     }
 
     void* MapRegion(MemoryRegion* region,
@@ -271,6 +295,9 @@ struct AddressSpace::Impl {
                 ret = VirtualProtect(ptr, size, prot, &resultvar);
                 ASSERT_MSG(ret, "VirtualProtect failed. {}", Common::GetLastErrorMsg());
             } else {
+                if (fd == -1) {
+                    CommitBacking(phys_addr, size);
+                }
                 if (prot == PAGE_NOACCESS) {
                     DWORD resultvar;
                     ptr = MapViewOfFile3(backing, process, reinterpret_cast<PVOID>(virtual_addr),
@@ -617,6 +644,7 @@ struct AddressSpace::Impl {
     HANDLE process{};
     HANDLE backing_handle{};
     u8* backing_base{};
+    bool lazy_commit{};
     u8* virtual_base{};
     u8* system_managed_base{};
     u64 system_managed_size{};
