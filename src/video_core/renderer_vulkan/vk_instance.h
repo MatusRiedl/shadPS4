@@ -477,6 +477,10 @@ public:
         return total_memory_budget;
     }
 
+    /// Overtime: the driver's current budget for this process on the heaps the usage counts
+    /// (it shrinks while other programs hold VRAM); 0 when it cannot be read.
+    [[nodiscard]] u64 GetDeviceMemoryBudgetNow() const;
+
     /// Determines if a format is supported for a set of feature flags.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 

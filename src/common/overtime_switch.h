@@ -8,6 +8,9 @@
 //                         flips, instead of the "Out of order flip IRQ" assert (crash)
 //   OVERTIME_POLL_THREAD  controllers (4 ms) and mouse (32 ms) polled from a sleeping thread
 //                         instead of SDL timers (SDL's timer thread spins before each tick)
+//   OVERTIME_GC_SECONDS   the texture collector ages images in seconds (20 / 5 / 1) instead of
+//                         guest submissions, and cards under 8 GB get its marks at 70 / 85 / 95 %
+//                         of the driver's current budget (the rule of thegh0sts' native port)
 
 #pragma once
 

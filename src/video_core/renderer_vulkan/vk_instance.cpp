@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -736,6 +737,16 @@ void Instance::CollectPhysicalMemoryInfo() {
         total_memory_budget =
             static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(2_GB)));
     }
+    // Overtime (tests): OVERTIME_VRAM_BUDGET_MB=N gives the texture cache the budget of a smaller
+    // card (N MiB, after the system reserve), so its collector marks can be tried on a big card.
+    // The usage it compares with them stays the real one.
+    if (const char* env = std::getenv("OVERTIME_VRAM_BUDGET_MB")) {
+        if (const u64 mb = std::strtoull(env, nullptr, 10); mb != 0) {
+            LOG_WARNING(Render_Vulkan, "GPU memory budget {} MiB replaced by OVERTIME_VRAM_BUDGET_MB",
+                        total_memory_budget / 1_MB);
+            total_memory_budget = mb << 20;
+        }
+    }
     LOG_INFO(Render_Vulkan, "GPU memory budget is {} MiB", total_memory_budget / 1_MB);
 }
 
@@ -808,6 +819,23 @@ u64 Instance::GetDeviceMemoryUsage() const {
         total_usage += memory_budget_props.heapUsage[heap];
     }
     return total_usage;
+}
+
+u64 Instance::GetDeviceMemoryBudgetNow() const {
+    if (!supports_memory_budget) {
+        return 0;
+    }
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
+    vk::PhysicalDeviceMemoryProperties2 props = {
+        .pNext = &memory_budget_props,
+    };
+    physical_device.getMemoryProperties2(&props);
+
+    u64 total_budget = 0;
+    for (const size_t heap : valid_heaps) {
+        total_budget += memory_budget_props.heapBudget[heap];
+    }
+    return total_budget;
 }
 
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {

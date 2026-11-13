@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <xxhash.h>
 
@@ -9,6 +12,7 @@
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/hash.h"
+#include "common/overtime_switch.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -22,6 +26,51 @@
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
+
+// Overtime (tests): OVERTIME_GC_LOG=<file> writes one CSV row a second: VRAM used and the
+// collector marks in MiB, then the images registered, freed and read back and the GPU waits
+// (scheduler.Finish) the collector made in that second.
+namespace {
+struct GcLog {
+    std::FILE* file{};
+    std::chrono::steady_clock::time_point start{}, last{};
+    u64 registered{}, freed{}, downloaded{}, finishes{};
+
+    GcLog() {
+        const char* path = std::getenv("OVERTIME_GC_LOG");
+        if (path && path[0] != 0) {
+            file = std::fopen(path, "w");
+        }
+        if (file) {
+            std::fputs("t_s,used_mb,trigger_mb,pressure_mb,critical_mb,registered,freed,"
+                       "downloaded,finishes\n",
+                       file);
+            start = last = std::chrono::steady_clock::now();
+        }
+    }
+
+    void Row(u64 used, u64 trigger, u64 pressure, u64 critical) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!file || now - last < std::chrono::seconds(1)) {
+            return;
+        }
+        last = now;
+        std::fprintf(file, "%.1f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                     std::chrono::duration<double>(now - start).count(),
+                     static_cast<unsigned long long>(used >> 20),
+                     static_cast<unsigned long long>(trigger >> 20),
+                     static_cast<unsigned long long>(pressure >> 20),
+                     static_cast<unsigned long long>(critical >> 20),
+                     static_cast<unsigned long long>(registered),
+                     static_cast<unsigned long long>(freed),
+                     static_cast<unsigned long long>(downloaded),
+                     static_cast<unsigned long long>(finishes));
+        std::fflush(file);
+        registered = freed = downloaded = finishes = 0;
+    }
+};
+GcLog gc_log;
+} // namespace
 
 static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
@@ -957,6 +1006,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    ++gc_log.registered;
     image.memory_usage_counter = &total_used_memory;
     total_used_memory += Common::AlignUp(image.SizeBytes(), 1024);
     image_lru_cache.Insert(image, gc_tick);
@@ -1096,21 +1146,75 @@ void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
+    // Overtime (OVERTIME_GC_SECONDS, on unless "0"): the collector rule of thegh0sts' native port
+    // (NHL-19-PS4-PORT-WINDOWS, gpu/shadps4 texture_cache.cpp, GPL-2.0-or-later), written for this
+    // tree. gc_tick counts guest submissions, hundreds a second, and the usage compared is all of
+    // the process's VRAM, which stays over the trigger on a discrete card. An age of 16 ticks
+    // (a few frames) then freed every texture that left the screen for a moment and uploaded it
+    // again when the camera turned back. Ages are seconds now: 20 unused below the pressure mark,
+    // 5 over it, 1 over the critical mark, and by submissions as before only when that was not
+    // enough or the driver's budget is nearly used up. Cards under 8 GB had their pressure mark
+    // at about 40 % of the budget; they get marks at 70 / 85 / 95 % of the driver's current
+    // budget instead (OVERTIME_VRAM_BUDGET_MB=N: of N MiB, for tests on a big card).
+    static const bool seconds_rule = Overtime::SwitchOn("OVERTIME_GC_SECONDS");
+    static const u64 forced_budget = [] {
+        const char* env = std::getenv("OVERTIME_VRAM_BUDGET_MB");
+        return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
+    }();
+    const u64 second = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count());
+    if (seconds_rule && second != gc_second) {
+        gc_second = second;
+        gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
+        if (instance.CanReportMemoryUsage() && !instance.IsIntegrated()) {
+            const u64 driver_budget = instance.GetDeviceMemoryBudgetNow();
+            const bool small_vram =
+                static_cast<s64>(instance.GetTotalMemoryBudget()) < TARGET_GC_THRESHOLD;
+            const u64 budget = forced_budget ? forced_budget : small_vram ? driver_budget : 0;
+            if (budget != 0) {
+                trigger_gc_memory = budget / 10 * 7;
+                pressure_gc_memory = budget / 100 * 85;
+                critical_gc_memory = budget / 100 * 95;
+            }
+            // Nearly all of what the driver gives this process is in use: no time to keep
+            // textures for seconds, the ages are submissions for the next two seconds.
+            if (driver_budget != 0 && total_used_memory >= driver_budget / 100 * 92) {
+                vram_short_until = second + 2;
+            }
+        }
+    }
+    gc_log.Row(total_used_memory, trigger_gc_memory, pressure_gc_memory, critical_gc_memory);
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;
+    u64 below_tick = 0;
     size_t num_deletions = 0;
     boost::container::small_vector<ImageId, 8> download_queue;
     boost::container::small_vector<ImageId, 8> maybe_download;
 
-    const auto configure = [&](bool allow_aggressive) {
+    // gc_tick at the start of that second (an older one when no submission came in it; 0, so
+    // nothing is old enough, until the emulator has run that long).
+    const auto tick_seconds_ago = [&](u64 seconds) {
+        return gc_tick_at_second[(second - seconds) % gc_tick_at_second.size()];
+    };
+    // emergency: still over the critical mark after freeing what was unused for a second.
+    const auto configure = [&](bool allow_aggressive, bool emergency = false) {
         pressured = total_used_memory >= pressure_gc_memory;
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
+        below_tick = gc_tick - ticks_to_destroy;
+        if (seconds_rule) {
+            if (!pressured && !aggresive) {
+                below_tick = std::min(below_tick, tick_seconds_ago(20));
+            } else if (!emergency && second >= vram_short_until) {
+                below_tick = std::min(below_tick, tick_seconds_ago(aggresive ? 1 : 5));
+            }
+        }
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
     };
     const auto clean_up = [&](Image& image) {
@@ -1124,8 +1228,10 @@ void TextureCache::GarbageCollectImages() {
             return false;
         }
         --num_deletions;
+        ++gc_log.freed;
         const auto image_id = slot_images.GetSlotId(image);
         if (download) {
+            ++gc_log.downloaded;
             UntrackImage(image_id);
             UnregisterImage(image_id);
             if (image.gpu_hash != 0) {
@@ -1154,16 +1260,22 @@ void TextureCache::GarbageCollectImages() {
 
     // Try to remove anything old enough and not high priority.
     configure(false);
-    image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    image_lru_cache.ForEachItemBelow(below_tick, clean_up);
 
     if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
-        image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+        image_lru_cache.ForEachItemBelow(below_tick, clean_up);
+    }
+    if (seconds_rule && total_used_memory >= critical_gc_memory) {
+        // Still over it: what was used a moment ago goes too (out of memory otherwise).
+        configure(true, true);
+        image_lru_cache.ForEachItemBelow(below_tick, clean_up);
     }
 
     if (!maybe_download.empty()) {
         // wait for memory reads to finish
+        ++gc_log.finishes;
         scheduler.Finish();
         scheduler.PopPendingOperations();
 
@@ -1189,6 +1301,7 @@ void TextureCache::GarbageCollectImages() {
         // We need to make downloads synchronous. It is possible that the contents
         // of the image are requested before they are downloaded in which case
         // outdated buffer cache contents are used instead.
+        ++gc_log.finishes;
         scheduler.Finish();
         scheduler.PopPendingOperations();
     }
