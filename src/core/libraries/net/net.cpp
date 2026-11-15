@@ -1152,7 +1152,7 @@ s32 PS4_SYSV_ABI sceNetEpollAbort(OrbisNetId eid, s32 flags) {
 
 s32 PS4_SYSV_ABI sceNetEpollControl(OrbisNetId eid, s32 op, OrbisNetId id,
                                     OrbisNetEpollEvent* event) {
-    LOG_DEBUG(Lib_Net, "eid = {}, op = {}, id = {}, events = {}", eid,
+    LOG_TRACE(Lib_Net, "eid = {}, op = {}, id = {}, events = {}", eid,
               op == ORBIS_NET_EPOLL_CTL_ADD   ? "ADD"
               : op == ORBIS_NET_EPOLL_CTL_MOD ? "MOD"
               : op == ORBIS_NET_EPOLL_CTL_DEL ? "DEL"
@@ -1203,7 +1203,7 @@ s32 PS4_SYSV_ABI sceNetEpollControl(OrbisNetId eid, s32 op, OrbisNetId id,
 }
 
 OrbisNetId PS4_SYSV_ABI sceNetEpollCreate(const char* name, s32 flags) {
-    LOG_DEBUG(Lib_Net, "name = {}, flags = {:#x}", name != nullptr ? name : "", flags);
+    LOG_TRACE(Lib_Net, "name = {}, flags = {:#x}", name != nullptr ? name : "", flags);
     if (flags != 0) {
         return SetErrno(ORBIS_NET_EINVAL);
     }
@@ -1215,7 +1215,7 @@ OrbisNetId PS4_SYSV_ABI sceNetEpollCreate(const char* name, s32 flags) {
 }
 
 s32 PS4_SYSV_ABI sceNetEpollDestroy(OrbisNetId eid) {
-    LOG_DEBUG(Lib_Net, "eid = {}", eid);
+    LOG_TRACE(Lib_Net, "eid = {}", eid);
     const auto kind = Core::Net::GetObjectKind(eid);
     if (kind && *kind != Core::Net::NetObjectKind::Epoll) {
         return SetErrno(ORBIS_NET_EPERM);
