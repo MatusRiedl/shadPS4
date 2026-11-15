@@ -70,6 +70,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
              Overtime::SwitchOn("OVERTIME_THREAD_PRIORITY"),
              Overtime::SwitchOn("OVERTIME_ASYNC_PIPELINES"),
              Overtime::SwitchOn("OVERTIME_VK_RECORDER"));
+    if (!EmulatorSettings.IsNullGPU() && Overtime::SwitchOn("OVERTIME_VK_RECORDER")) {
+        scheduler.EnableRecorder();
+        LOG_INFO(Core, "Overtime recorder thread on (direct draws are recorded on it)");
+    }
     memory->SetRasterizer(this);
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
@@ -269,13 +273,35 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     const auto state = BeginRendering(pipeline);
 
-    BindVertexBuffers(pipeline);
+    // Overtime recorder: the binds and the draw go into a packet that the recorder thread records.
+    DrawPacket* packet = scheduler.IsRecorderOn() ? &scheduler.BeginPacket() : nullptr;
+    BindVertexBuffers(pipeline, packet);
     if (is_indexed) {
-        BindIndexBuffer(index_offset);
+        BindIndexBuffer(index_offset, false, packet);
     }
 
     if (needs_barrier) {
         runtime.FlushBarriers();
+    }
+
+    if (packet) {
+        const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
+        const auto& fetch_shader = pipeline->GetFetchShader();
+        const auto [vertex_offset, instance_offset] =
+            GetDrawOffsets(regs, vs_info, fetch_shader);
+        pipeline->BindResources(set_writes, push_data, *packet);
+        UpdateDynamicState(pipeline, is_indexed, packet);
+        scheduler.BeginRendering(state, *packet);
+        packet->pipeline = pipeline->Handle();
+        packet->indexed = is_indexed;
+        packet->count = regs.num_indices;
+        packet->instances = regs.num_instances.NumInstances();
+        packet->vertex_offset = vertex_offset;
+        packet->instance_offset = instance_offset;
+        scheduler.SubmitPacket();
+        DebugState.IncDrawCall();
+        ResetBindings(false);
+        return;
     }
 
     pipeline->BindResources(set_writes, push_data);
@@ -524,7 +550,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     return true;
 }
 
-void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline, DrawPacket* packet) {
     const auto& regs = liverpool->regs;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -535,8 +561,14 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 
     if (instance.IsVertexInputDynamicState()) {
         // Update current vertex inputs.
-        const auto cmdbuf = scheduler.CommandBuffer();
-        cmdbuf.setVertexInputEXT(bindings, attributes);
+        if (packet) {
+            packet->set_vertex_input = true;
+            packet->vertex_bindings.assign(bindings.begin(), bindings.end());
+            packet->vertex_attributes.assign(attributes.begin(), attributes.end());
+        } else {
+            const auto cmdbuf = scheduler.CommandBuffer();
+            cmdbuf.setVertexInputEXT(bindings, attributes);
+        }
     }
 
     if (bindings.empty()) {
@@ -613,6 +645,16 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         host_strides.push_back(buffer.GetStride());
     }
 
+    if (packet) {
+        packet->bind_vertex_buffers2 = !instance.IsVertexInputDynamicState();
+        packet->vertex_buffers.assign(host_buffers.begin(), host_buffers.end());
+        packet->vertex_offsets.assign(host_offsets.begin(), host_offsets.end());
+        if (packet->bind_vertex_buffers2) {
+            packet->vertex_sizes.assign(host_sizes.begin(), host_sizes.end());
+            packet->vertex_strides.assign(host_strides.begin(), host_strides.end());
+        }
+        return;
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto num_buffers = guest_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
@@ -623,7 +665,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     }
 }
 
-void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
+void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect, DrawPacket* packet) {
     const auto& regs = liverpool->regs;
 
     // Figure out index type and size.
@@ -658,6 +700,15 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
         index_buffer = null_buffer->Handle();
     }
 
+    if (packet) {
+        packet->bind_index = true;
+        packet->bind_index2 = instance.IsMaintenance5Supported();
+        packet->index_buffer = index_buffer;
+        packet->index_offset = buffer_offset;
+        packet->index_size = index_buffer_size;
+        packet->index_type = index_type;
+        return;
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     if (instance.IsMaintenance5Supported()) {
         cmdbuf.bindIndexBuffer2KHR(index_buffer, buffer_offset, index_buffer_size, index_type);
@@ -1453,7 +1504,8 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     }
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed,
+                                    DrawPacket* packet) const {
     UpdateViewportScissorState();
     UpdateDepthStencilState();
     UpdatePrimitiveState(is_indexed);
@@ -1461,6 +1513,12 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     UpdateColorBlendingState(pipeline);
 
     auto& dynamic_state = scheduler.GetDynamicState();
+    if (packet) {
+        // The recorder commits the copy; the flags it leaves set come back on the next drain.
+        packet->dynamic_state = dynamic_state;
+        std::memset(&dynamic_state.dirty_state, 0, sizeof(dynamic_state.dirty_state));
+        return;
+    }
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
 }
 

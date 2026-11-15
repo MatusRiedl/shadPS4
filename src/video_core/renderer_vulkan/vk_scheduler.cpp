@@ -1,8 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/logging/log.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -23,6 +30,7 @@ Scheduler::Scheduler(const Instance& instance)
 }
 
 Scheduler::~Scheduler() {
+    StopRecorder();
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
@@ -52,14 +60,7 @@ void Scheduler::SubmitOutOfBand(vk::CommandBuffer cmdbuf, vk::Fence fence, u64 w
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 }
 
-void Scheduler::BeginRendering(const RenderState& new_state) {
-    if (is_rendering && render_state == new_state) {
-        return;
-    }
-    EndRendering();
-    is_rendering = true;
-    render_state = new_state;
-
+static void RecordBeginRendering(vk::CommandBuffer cmdbuf, const RenderState& render_state) {
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
         const auto& cb = render_state.color_attachments[i];
@@ -104,7 +105,28 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    CommandBuffer().beginRendering(rendering_info);
+    cmdbuf.beginRendering(rendering_info);
+}
+
+void Scheduler::BeginRendering(const RenderState& new_state) {
+    if (is_rendering && render_state == new_state) {
+        return;
+    }
+    EndRendering();
+    is_rendering = true;
+    render_state = new_state;
+    RecordBeginRendering(CommandBuffer(), render_state);
+}
+
+void Scheduler::BeginRendering(const RenderState& new_state, DrawPacket& packet) {
+    if (is_rendering && render_state == new_state) {
+        return;
+    }
+    packet.end_rendering = is_rendering;
+    packet.begin_rendering = true;
+    packet.render_state = new_state;
+    is_rendering = true;
+    render_state = new_state;
 }
 
 void Scheduler::EndRendering() {
@@ -176,7 +198,7 @@ void Scheduler::BeginSession() {
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
-    session.primary = command_pool.Commit();
+    session.primary = primary_pool ? primary_pool->Commit() : command_pool.Commit();
     Check(session.primary.begin(begin_info));
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
@@ -195,6 +217,9 @@ void Scheduler::BeginSession() {
 void Scheduler::EndSession() {
     if (sessions.empty()) {
         return;
+    }
+    if (recorder_on) {
+        DrainRecorder();
     }
 
     if (on_session) {
@@ -457,6 +482,247 @@ void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmd
         cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_enabled
                                                       ? vk::ImageAspectFlagBits::eColor
                                                       : vk::ImageAspectFlagBits::eNone);
+    }
+}
+
+// Overtime recorder (OVERTIME_VK_RECORDER). The GPU thread fills a DrawPacket per direct draw and
+// the recorder thread records it into the command buffer. Every direct use of the command buffer
+// (CommandBuffer(), EndSession) waits for the recorder first, so the order of commands is kept.
+
+namespace {
+
+void CpuRelax() {
+#if defined(_M_X64) || defined(__x86_64__)
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+
+template <typename Flags>
+void OrFlags(Flags& dst, const Flags& src) {
+    auto* d = reinterpret_cast<u8*>(&dst);
+    const auto* s = reinterpret_cast<const u8*>(&src);
+    for (size_t i = 0; i < sizeof(Flags); ++i) {
+        d[i] |= s[i];
+    }
+}
+
+} // Anonymous namespace
+
+void DrawPacket::Reset() {
+    set_vertex_input = false;
+    vertex_bindings.clear();
+    vertex_attributes.clear();
+    bind_vertex_buffers2 = false;
+    vertex_buffers.clear();
+    vertex_offsets.clear();
+    vertex_sizes.clear();
+    vertex_strides.clear();
+    bind_index = false;
+    bind_index2 = false;
+    push_size = 0;
+    push_descriptors = false;
+    bind_set = false;
+    writes.clear();
+    buffer_infos.clear();
+    image_infos.clear();
+    texel_views.clear();
+    end_rendering = false;
+    begin_rendering = false;
+    indexed = false;
+}
+
+void Scheduler::EnableRecorder() {
+    if (recorder_on) {
+        return;
+    }
+    primary_pool = std::make_unique<CommandPool>(instance, &work_semaphore);
+    recorder_ring = std::make_unique<DrawPacket[]>(RecorderRing);
+    // The current primary comes from the shared pool: continue in a session of the own pool.
+    BeginSession();
+    recorder_stat_time = std::chrono::steady_clock::now();
+    recorder_on = true;
+    recorder_thread = std::thread(&Scheduler::RecorderThread, this);
+}
+
+void Scheduler::StopRecorder() {
+    if (!recorder_thread.joinable()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{recorder_mutex};
+        recorder_stop = true;
+    }
+    recorder_cv.notify_all();
+    recorder_thread.join();
+}
+
+DrawPacket& Scheduler::BeginPacket() {
+    if (recorder_owner == std::thread::id{}) {
+        recorder_owner = std::this_thread::get_id();
+    }
+    const u64 index = recorder_submitted.load(std::memory_order_relaxed);
+    if (index - recorder_done.load(std::memory_order_acquire) >= RecorderRing) {
+        ++recorder_stat_full;
+        WaitRecorder(index - RecorderRing + 1);
+    }
+    auto& packet = recorder_ring[index % RecorderRing];
+    packet.Reset();
+    return packet;
+}
+
+void Scheduler::SubmitPacket() {
+    const u64 index = recorder_submitted.load(std::memory_order_relaxed);
+    recorder_ring[index % RecorderRing].cmdbuf = sessions.back().primary;
+    recorder_submitted.store(index + 1); // seq_cst: pairs with recorder_sleeping
+    if (recorder_sleeping.load()) {
+        std::scoped_lock lock{recorder_mutex};
+        recorder_cv.notify_one();
+    }
+
+    if ((++recorder_stat_packets & 1023) == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - recorder_stat_time >= std::chrono::seconds{10}) {
+            LOG_INFO(Core,
+                     "Overtime recorder (last 10 s): {} draws recorded on the recorder thread, "
+                     "{} waits for it ({:.1f} ms in all), {} full-ring waits",
+                     recorder_stat_packets, recorder_stat_waits,
+                     double(recorder_stat_wait_ns) / 1'000'000.0, recorder_stat_full);
+            recorder_stat_packets = recorder_stat_waits = recorder_stat_full = 0;
+            recorder_stat_wait_ns = 0;
+            recorder_stat_time = now;
+        }
+    }
+}
+
+void Scheduler::DrainRecorder() {
+    const u64 submitted = recorder_submitted.load(std::memory_order_relaxed);
+    if (submitted == recorder_merged) {
+        return;
+    }
+    if (recorder_done.load(std::memory_order_acquire) != submitted) {
+        WaitRecorder(submitted);
+    }
+    // The recorder is idle: take back the dirty flags its last Commit left set, so a draw
+    // committed here emits them.
+    OrFlags(dynamic_state.dirty_state, recorder_carry);
+    std::memset(&recorder_carry, 0, sizeof(recorder_carry));
+    recorder_merged = submitted;
+}
+
+void Scheduler::WaitRecorder(u64 packets) {
+    if (std::this_thread::get_id() != recorder_owner && !recorder_warned_thread) {
+        recorder_warned_thread = true;
+        LOG_ERROR(Render_Vulkan, "Overtime recorder: command buffer used from a second thread");
+    }
+    const auto start = std::chrono::steady_clock::now();
+    for (u32 spin = 0; spin < 16384; ++spin) {
+        if (recorder_done.load(std::memory_order_acquire) >= packets) {
+            break;
+        }
+        CpuRelax();
+    }
+    if (recorder_done.load(std::memory_order_acquire) < packets) {
+        std::unique_lock lock{drain_mutex};
+        drain_waiting.store(true); // seq_cst: pairs with recorder_done
+        u32 slices = 0;
+        while (!drain_cv.wait_for(lock, std::chrono::seconds{2},
+                                  [&] { return recorder_done.load() >= packets; })) {
+            LOG_WARNING(Render_Vulkan, "Overtime recorder still busy after {} s ({} of {} draws)",
+                        ++slices * 2, recorder_done.load(), packets);
+        }
+        drain_waiting.store(false);
+    }
+    ++recorder_stat_waits;
+    recorder_stat_wait_ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             start)
+            .count());
+}
+
+void Scheduler::RecorderThread() {
+    Common::SetCurrentThreadName("shadPS4:VkRecorder");
+    u64 next = 0;
+    for (;;) {
+        u64 available = recorder_submitted.load(std::memory_order_acquire);
+        for (u32 spin = 0; spin < 2048 && available == next; ++spin) {
+            CpuRelax();
+            available = recorder_submitted.load(std::memory_order_acquire);
+        }
+        if (available == next) {
+            std::unique_lock lock{recorder_mutex};
+            recorder_sleeping.store(true); // seq_cst: pairs with recorder_submitted
+            recorder_cv.wait(lock,
+                             [&] { return recorder_stop || recorder_submitted.load() != next; });
+            recorder_sleeping.store(false);
+            if (recorder_stop) {
+                return;
+            }
+            continue;
+        }
+        for (; next < available; ++next) {
+            RecordPacket(recorder_ring[next % RecorderRing]);
+            recorder_done.store(next + 1); // seq_cst: pairs with drain_waiting
+            if (drain_waiting.load()) {
+                std::scoped_lock lock{drain_mutex};
+                drain_cv.notify_all();
+            }
+        }
+    }
+}
+
+void Scheduler::RecordPacket(DrawPacket& p) {
+    const vk::CommandBuffer cmdbuf = p.cmdbuf;
+    if (p.set_vertex_input) {
+        cmdbuf.setVertexInputEXT(p.vertex_bindings, p.vertex_attributes);
+    }
+    if (!p.vertex_buffers.empty()) {
+        const auto num_buffers = static_cast<u32>(p.vertex_buffers.size());
+        if (p.bind_vertex_buffers2) {
+            cmdbuf.bindVertexBuffers2(0, num_buffers, p.vertex_buffers.data(),
+                                      p.vertex_offsets.data(), p.vertex_sizes.data(),
+                                      p.vertex_strides.data());
+        } else {
+            cmdbuf.bindVertexBuffers(0, num_buffers, p.vertex_buffers.data(),
+                                     p.vertex_offsets.data());
+        }
+    }
+    if (p.bind_index) {
+        if (p.bind_index2) {
+            cmdbuf.bindIndexBuffer2KHR(p.index_buffer, p.index_offset, p.index_size,
+                                       p.index_type);
+        } else {
+            cmdbuf.bindIndexBuffer(p.index_buffer, p.index_offset, p.index_type);
+        }
+    }
+    if (p.push_size) {
+        cmdbuf.pushConstants(p.layout, p.push_stages, 0U, p.push_size, p.push_data.data());
+    }
+    if (p.push_descriptors) {
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, p.layout, 0, p.writes);
+    } else if (p.bind_set) {
+        cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, p.layout, 0, p.desc_set, {});
+    }
+
+    // The GPU thread cleared its flags when it made the packet; what this Commit leaves set
+    // carries over to the next packet (or back to the GPU thread when it drains).
+    OrFlags(p.dynamic_state.dirty_state, recorder_carry);
+    p.dynamic_state.Commit(instance, cmdbuf);
+    recorder_carry = p.dynamic_state.dirty_state;
+
+    if (p.begin_rendering) {
+        if (p.end_rendering) {
+            cmdbuf.endRendering();
+        }
+        RecordBeginRendering(cmdbuf, p.render_state);
+    }
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, p.pipeline);
+    if (p.indexed) {
+        cmdbuf.drawIndexed(p.count, p.instances, 0, static_cast<s32>(p.vertex_offset),
+                           p.instance_offset);
+    } else {
+        cmdbuf.draw(p.count, p.instances, p.vertex_offset, p.instance_offset);
     }
 }
 

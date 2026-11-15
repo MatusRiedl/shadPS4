@@ -24,6 +24,7 @@ static constexpr auto AllGraphicsStageBits =
 class Instance;
 class Scheduler;
 class DescriptorHeap;
+struct DrawPacket;
 
 class Pipeline {
 public:
@@ -59,6 +60,10 @@ public:
 
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
+    // Overtime recorder: the same binds, stored in the packet for the recorder thread. A
+    // descriptor set from the heap is written here, on the calling thread.
+    void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data,
+                       DrawPacket& packet) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;

@@ -4,10 +4,13 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <queue>
+#include <vector>
 
 #include "common/interval_set.h"
 #include "common/unique_function.h"
@@ -348,6 +351,56 @@ struct DynamicState {
     }
 };
 
+/// Overtime recorder (OVERTIME_VK_RECORDER): everything one direct draw records into the command
+/// buffer, as owned copies, so the recorder thread records it while the GPU thread processes the
+/// next draw. Ring slots are reused, so the vectors stop allocating after the first frames.
+struct DrawPacket {
+    vk::CommandBuffer cmdbuf; // set by Scheduler::SubmitPacket
+
+    bool set_vertex_input;
+    std::vector<vk::VertexInputBindingDescription2EXT> vertex_bindings;
+    std::vector<vk::VertexInputAttributeDescription2EXT> vertex_attributes;
+    bool bind_vertex_buffers2; // with sizes and strides (no dynamic vertex input)
+    std::vector<vk::Buffer> vertex_buffers;
+    std::vector<vk::DeviceSize> vertex_offsets;
+    std::vector<vk::DeviceSize> vertex_sizes;
+    std::vector<vk::DeviceSize> vertex_strides;
+
+    bool bind_index;
+    bool bind_index2; // bindIndexBuffer2KHR (maintenance5)
+    vk::Buffer index_buffer;
+    vk::DeviceSize index_offset;
+    vk::DeviceSize index_size;
+    vk::IndexType index_type;
+
+    vk::PipelineLayout layout;
+    vk::ShaderStageFlags push_stages;
+    u32 push_size;
+    std::array<u8, 128> push_data;
+    bool push_descriptors;
+    bool bind_set;
+    vk::DescriptorSet desc_set;
+    std::vector<vk::WriteDescriptorSet> writes; // point into the three vectors below
+    std::vector<vk::DescriptorBufferInfo> buffer_infos;
+    std::vector<vk::DescriptorImageInfo> image_infos;
+    std::vector<vk::BufferView> texel_views;
+
+    DynamicState dynamic_state; // values and dirty flags at the draw
+
+    bool end_rendering;
+    bool begin_rendering;
+    RenderState render_state;
+
+    vk::Pipeline pipeline;
+    bool indexed;
+    u32 count;
+    u32 instances;
+    u32 vertex_offset;
+    u32 instance_offset;
+
+    void Reset();
+};
+
 using SessionFunc = Common::UniqueFunction<void>;
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
@@ -405,10 +458,30 @@ public:
         return dynamic_state;
     }
 
-    /// Returns the current command buffer.
-    vk::CommandBuffer CommandBuffer() const {
+    /// Returns the current command buffer. With the recorder on, waits until it recorded every
+    /// submitted packet first, so commands recorded here keep their order.
+    vk::CommandBuffer CommandBuffer() {
+        if (recorder_on) {
+            DrainRecorder();
+        }
         return sessions.back().primary;
     }
+
+    /// Starts the Overtime recorder thread for this scheduler (the rasterizer's only).
+    void EnableRecorder();
+
+    [[nodiscard]] bool IsRecorderOn() const noexcept {
+        return recorder_on;
+    }
+
+    /// GPU thread: the next free packet, reset. Fill it, then call SubmitPacket.
+    DrawPacket& BeginPacket();
+
+    /// GPU thread: hands the packet of BeginPacket to the recorder thread.
+    void SubmitPacket();
+
+    /// Starts a new rendering scope inside a packet (the recorder records it).
+    void BeginRendering(const RenderState& new_state, DrawPacket& packet);
 
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
@@ -462,6 +535,12 @@ private:
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
+    void DrainRecorder();
+    void WaitRecorder(u64 packets);
+    void RecorderThread();
+    void RecordPacket(DrawPacket& packet);
+    void StopRecorder();
+
 private:
     const Instance& instance;
     Semaphore work_semaphore;
@@ -489,6 +568,32 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
+
+    // Overtime recorder. Primary command buffers come from their own pool once it is on, so the
+    // recorder thread and the GPU thread (upload command buffers) never share a pool.
+    static constexpr u64 RecorderRing = 64;
+    bool recorder_on{};
+    std::unique_ptr<CommandPool> primary_pool;
+    std::unique_ptr<DrawPacket[]> recorder_ring;
+    std::atomic<u64> recorder_submitted{0};
+    std::atomic<u64> recorder_done{0};
+    u64 recorder_merged{0}; // packets whose leftover dirty flags are back in dynamic_state
+    std::atomic<bool> recorder_sleeping{false};
+    std::atomic<bool> drain_waiting{false};
+    std::mutex recorder_mutex;
+    std::condition_variable recorder_cv;
+    bool recorder_stop{}; // under recorder_mutex
+    std::mutex drain_mutex;
+    std::condition_variable drain_cv;
+    std::thread recorder_thread;
+    std::thread::id recorder_owner{};             // the GPU thread (first BeginPacket)
+    decltype(DynamicState::dirty_state) recorder_carry{}; // left set by the recorder's last Commit
+    u32 recorder_stat_packets{};
+    u32 recorder_stat_waits{};
+    u32 recorder_stat_full{};
+    u64 recorder_stat_wait_ns{};
+    std::chrono::steady_clock::time_point recorder_stat_time{};
+    bool recorder_warned_thread{};
 };
 
 } // namespace Vulkan

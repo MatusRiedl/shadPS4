@@ -235,7 +235,7 @@ void ApplyOvertimePriority(HANDLE thread, std::string_view name) {
         return;
     }
     int priority;
-    if (name == "shadPS4:GpuCommandProcessor") {
+    if (name == "shadPS4:GpuCommandProcessor" || name == "shadPS4:VkRecorder") {
         priority = THREAD_PRIORITY_HIGHEST;
     } else if (name == "shadPS4:PresentThread" ||
                std::ranges::any_of(std::initializer_list<std::string_view>{

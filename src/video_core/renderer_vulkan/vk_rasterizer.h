@@ -109,7 +109,8 @@ private:
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
-    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
+                            DrawPacket* packet = nullptr) const;
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
@@ -123,8 +124,10 @@ private:
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
 
-    void BindVertexBuffers(const GraphicsPipeline* pipeline);
-    void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
+    // With a packet (Overtime recorder) the binds are stored in it instead of recorded.
+    void BindVertexBuffers(const GraphicsPipeline* pipeline, DrawPacket* packet = nullptr);
+    void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false,
+                         DrawPacket* packet = nullptr);
 
     void ResetBindings(bool is_compute);
 
