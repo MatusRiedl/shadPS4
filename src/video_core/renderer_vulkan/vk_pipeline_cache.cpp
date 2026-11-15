@@ -6,7 +6,9 @@
 
 #include "common/hash.h"
 #include "common/io_file.h"
+#include "common/overtime_switch.h"
 #include "common/path_util.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -375,24 +377,160 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+
+    // Overtime async pipelines. Needs dynamic vertex input (otherwise the pipeline bakes the
+    // vertex layout read from guest buffers) and stays off with shader collect (ReplaceShader
+    // destroys modules and pipelines a worker could be using).
+    const bool async_switch = Overtime::SwitchOn("OVERTIME_ASYNC_PIPELINES");
+    async_pipelines = async_switch && instance.IsVertexInputDynamicState() &&
+                      !EmulatorSettings.IsShaderCollect();
+    if (async_pipelines) {
+        const u32 count = std::clamp(std::thread::hardware_concurrency() / 4, 1U, 4U);
+        for (u32 i = 0; i < count; ++i) {
+            async_workers.emplace_back(&PipelineCache::AsyncWorker, this, i);
+        }
+        LOG_INFO(Core, "Overtime async pipelines: {} workers", count);
+    } else if (async_switch) {
+        LOG_INFO(Core, "Overtime async pipelines off: {}",
+                 instance.IsVertexInputDynamicState() ? "shader collect is on"
+                                                      : "no dynamic vertex input on this GPU");
+    }
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    {
+        std::scoped_lock lock{async_mutex};
+        async_stop = true;
+    }
+    async_job_cv.notify_all();
+    for (auto& worker : async_workers) {
+        worker.join();
+    }
+}
+
+void PipelineCache::AsyncWorker(u32 index) {
+    Common::SetCurrentThreadName(fmt::format("shadPS4:PipelineWorker{}", index).c_str());
+    for (;;) {
+        GraphicsPipeline* pipeline;
+        {
+            std::unique_lock lock{async_mutex};
+            async_job_cv.wait(lock, [this] { return async_stop || !async_jobs.empty(); });
+            if (async_stop) {
+                return;
+            }
+            pipeline = async_jobs.front();
+            async_jobs.pop_front();
+        }
+        pipeline->FinishCreate();
+        {
+            // A waiter checks IsReady under the lock, so it cannot miss this notify.
+            std::scoped_lock lock{async_mutex};
+        }
+        async_done_cv.notify_all();
+    }
+}
+
+void PipelineCache::AsyncWait(GraphicsPipeline* pipeline) {
+    std::unique_lock lock{async_mutex};
+    if (const auto it = std::ranges::find(async_jobs, pipeline); it != async_jobs.end()) {
+        // Not started yet: create it here instead of waiting behind the other jobs.
+        async_jobs.erase(it);
+        lock.unlock();
+        pipeline->FinishCreate();
+        ++async_inline;
+        return;
+    }
+    ++async_waited;
+    async_done_cv.wait(lock, [pipeline] { return pipeline->IsReady(); });
+}
+
+// Counts draws per guest frame and how many frames in a row this draw's render target was drawn.
+// Returns true when a new pipeline of this draw may be created on a worker and the draw skipped:
+// the last frame had at least 300 draws, the draw is direct with more than 12 indices, and its
+// render target was drawn in each of the last 8 frames (so a skipped draw is redrawn next frame).
+bool PipelineCache::AsyncTrackDraw() {
+    const u32 frame = DebugState.GetFrameNum();
+    if (frame != async_frame) {
+        async_last_frame_draws = frame == async_frame + 1 ? async_frame_draws : 0;
+        async_frame = frame;
+        async_frame_draws = 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - async_last_log >= std::chrono::seconds{10}) {
+            if (async_queued || async_skipped || async_waited || async_inline) {
+                LOG_INFO(Core,
+                         "Overtime async pipelines (last 10 s): {} created on workers, {} draws "
+                         "skipped, {} waits, {} taken back",
+                         async_queued, async_skipped, async_waited, async_inline);
+                async_queued = async_skipped = async_waited = async_inline = 0;
+            }
+            async_last_log = now;
+        }
+    }
+    ++async_frame_draws;
+
+    const auto& regs = liverpool->regs;
+    u64 target = 0;
+    if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
+        for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            const auto& col_buf = regs.color_buffers[cb];
+            if (col_buf &&
+                (regs.color_target_mask.GetMask(cb) & regs.color_shader_mask.GetMask(cb))) {
+                target = col_buf.Address();
+                break;
+            }
+        }
+    }
+    if (target == 0 && regs.depth_buffer.DepthValid()) {
+        target = regs.depth_buffer.DepthAddress();
+    }
+    if (target != async_last_target || frame != async_last_target_frame) {
+        async_last_target = target;
+        async_last_target_frame = frame;
+        if (async_target_streaks.size() > 4096) {
+            async_target_streaks.clear();
+        }
+        auto [it, is_new] = async_target_streaks.try_emplace(target, TargetStreak{frame, 1});
+        if (!is_new) {
+            auto& streak = it.value();
+            if (streak.last_frame + 1 == frame) {
+                ++streak.frames;
+            } else if (streak.last_frame != frame) {
+                streak.frames = 1;
+            }
+            streak.last_frame = frame;
+        }
+        async_target_frames = it->second.frames;
+    }
+    return async_last_frame_draws >= 300 && !draw_indirect_params.is_indirect &&
+           regs.num_indices > 12 && target != 0 && async_target_frames >= 8;
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
+    const bool may_defer = async_pipelines && AsyncTrackDraw();
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
-        LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+        LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}{}", pipeline_hash,
+                 may_defer ? " on a worker" : "");
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+            runtime_infos, fetch_shader, modules, sdata, false, may_defer);
+        if (may_defer) {
+            GraphicsPipeline* pipeline = it.value().get();
+            pipeline->queued_frame = async_frame;
+            {
+                std::scoped_lock lock{async_mutex};
+                async_jobs.push_back(pipeline);
+            }
+            async_job_cv.notify_one();
+            ++async_queued;
+        }
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -406,7 +544,17 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             }
         }
     }
-    return it->second.get();
+    GraphicsPipeline* pipeline = it->second.get();
+    if (!pipeline->IsReady()) [[unlikely]] {
+        // Skip the draw while a worker creates its pipeline, unless the draw is not one that
+        // may be skipped or the pipeline has been pending for a second (60 guest frames).
+        if (may_defer && async_frame - pipeline->queued_frame < 60) {
+            ++async_skipped;
+            return nullptr;
+        }
+        AsyncWait(pipeline);
+    }
+    return pipeline;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {

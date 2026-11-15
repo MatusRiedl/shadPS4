@@ -3,7 +3,13 @@
 
 #pragma once
 
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <variant>
+#include <vector>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -119,6 +125,11 @@ private:
         return num_new_pipelines > 0;
     }
 
+    // Overtime async pipelines (OVERTIME_ASYNC_PIPELINES)
+    bool AsyncTrackDraw();
+    void AsyncWorker(u32 index);
+    void AsyncWait(GraphicsPipeline* pipeline);
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
@@ -144,6 +155,32 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    // Overtime async pipelines: a new graphics pipeline of a busy frame is created by a worker
+    // and its draws are skipped meanwhile (rule of thegh0sts' native port, BB_ASYNC_PIPELINES).
+    struct TargetStreak {
+        u32 last_frame;
+        u32 frames;
+    };
+    bool async_pipelines{};
+    std::vector<std::thread> async_workers;
+    std::mutex async_mutex;
+    std::condition_variable async_job_cv;
+    std::condition_variable async_done_cv;
+    std::deque<GraphicsPipeline*> async_jobs;
+    bool async_stop{};
+    u32 async_frame{};
+    u32 async_frame_draws{};
+    u32 async_last_frame_draws{};
+    u64 async_last_target{};
+    u32 async_last_target_frame{};
+    u32 async_target_frames{};
+    tsl::robin_map<u64, TargetStreak> async_target_streaks;
+    u32 async_queued{};
+    u32 async_skipped{};
+    u32 async_waited{};
+    u32 async_inline{};
+    std::chrono::steady_clock::time_point async_last_log{};
 };
 
 } // namespace Vulkan

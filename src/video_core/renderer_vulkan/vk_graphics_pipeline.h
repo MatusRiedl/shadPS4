@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -91,8 +93,20 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      const Shader::Gcn::FetchShaderData* fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, bool defer_create = false);
     ~GraphicsPipeline();
+
+    /// False while a pipeline built with defer_create waits for FinishCreate.
+    [[nodiscard]] bool IsReady() const noexcept {
+        return ready.load(std::memory_order_acquire);
+    }
+
+    /// Creates the Vulkan pipeline of a pipeline built with defer_create. Any thread, once.
+    /// Everything it reads was copied on the constructing thread, so it touches no guest memory.
+    void FinishCreate();
+
+    /// Guest frame in which a deferred pipeline was queued (Overtime async pipelines).
+    u32 queued_frame{};
 
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
         return fetch_shader;
@@ -110,11 +124,16 @@ public:
                          u32 step_rate_1) const;
 
 private:
+    struct CreateInputs;
+
     void BuildDescSetLayout(bool preloading);
+    void CreatePipeline(const CreateInputs& in);
 
 private:
     GraphicsPipelineKey key;
     Shader::Gcn::FetchShaderData fetch_shader{};
+    std::unique_ptr<CreateInputs> pending_create;
+    std::atomic<bool> ready{true};
 };
 
 struct ClipDistanceShaderKey {
