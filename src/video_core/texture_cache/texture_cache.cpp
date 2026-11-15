@@ -151,12 +151,8 @@ void TextureCache::ProcessDownloadImages() {
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id);
     }
-    AmdGpu::cp_perf.img_downloads += static_cast<u32>(download_images.size());
     download_images.clear();
-    {
-        const AmdGpu::CpPerfScope perf_finish{AmdGpu::cp_perf.img_finish_ns};
-        scheduler.Finish();
-    }
+    scheduler.Finish();
     scheduler.PopPendingOperations();
 }
 
@@ -223,10 +219,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     if (is_priority) {
         scheduler.DeferPriorityOperation(std::move(write_data));
     } else if (is_sync) {
-        {
-            const AmdGpu::CpPerfScope perf_finish{AmdGpu::cp_perf.img_finish_ns};
-            scheduler.Finish();
-        }
+        scheduler.Finish();
         write_data();
     } else {
         scheduler.DeferOperation(std::move(write_data));

@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -32,101 +30,6 @@ struct VideoOutPort;
 }
 
 namespace AmdGpu {
-
-inline u64 PerfNs() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-/// Timing of the current command processor cycle (wake to GpuIdle), GPU thread only.
-struct CpPerf {
-    u64 vo_block_ns;
-    u64 vo_spin_ns;
-    u64 mem_spin_ns;
-    u64 asc_spin_ns;
-    u64 draw_ns;
-    u64 draw_pipeline_ns;
-    u64 draw_bind_ns;
-    u64 dispatch_ns;
-    u64 dispatch_pipeline_ns;
-    u64 copy_ns;
-    u64 fence_ns;
-    u64 eop_ns;
-    u64 flush_ns;
-    u32 vo_blocks;
-    u32 mem_spins;
-    u32 tasks;
-    u32 draws;
-    u32 dispatches;
-    u32 flushes;
-    u64 draw_prep_ns;     ///< PrepareRenderState
-    u64 draw_begin_ns;    ///< BeginRendering
-    u64 bind_buffers_ns;  ///< BindBuffers, draws and dispatches
-    u64 bind_textures_ns; ///< BindTextures, draws and dispatches
-    u64 dma_sync_ns;      ///< SynchronizeDmaBuffers
-    u64 eos_ns;           ///< EVENT_WRITE_EOS handling
-    u64 commands_ns;      ///< Commands from other threads run on the GPU thread
-    u32 eos;
-    u32 commands;
-    u64 draw_pre_ns;     ///< Draw: periodic flush, pending ops, filter
-    u64 draw_vb_ns;      ///< Draw: vertex and index buffers
-    u64 draw_barrier_ns; ///< Draw: FlushBarriers
-    u64 draw_desc_ns;    ///< Draw: pipeline descriptor/push updates
-    u64 draw_dyn_ns;     ///< Draw: UpdateDynamicState
-    u64 draw_rp_ns;      ///< Draw: Scheduler::BeginRendering
-    u64 draw_cmd_ns;     ///< Draw: bind pipeline and draw command
-    u32 draw_barriers;   ///< Draws that flushed barriers
-    u32 render_passes;   ///< Dynamic rendering passes begun
-    u32 zpass_dumps;     ///< ZPASS_DONE occlusion counter dumps (results are synthesized)
-    u32 obtains;         ///< BufferCache::ObtainBuffer calls
-    u32 obtain_stream;   ///< Read-only bindings copied into the stream buffer
-    u64 obtain_stream_bytes;
-    u32 obtain_stream_reused; ///< ... that reused an identical copy of the same command buffer
-    u64 obtain_stream_reused_bytes;
-    u32 obtain_written; ///< Writable bindings
-    u32 obtain_uploads; ///< Bindings that uploaded CPU-modified pages into the arena
-    u64 obtain_upload_bytes;
-    u32 obtain_texel;       ///< Read-only texel bindings checked against images
-    u32 obtain_texel_image; ///< ... that were filled from metadata or an image
-    u64 pipe_key_ns;        ///< Pipeline lookup: RefreshGraphicsKey
-    u32 pipe_changes;       ///< Draws whose pipeline differs from the previous draw's
-    u64 vi_inputs_ns;       ///< Vertex buffers: GetVertexInputs and setVertexInputEXT
-    u64 vi_obtain_ns;       ///< Vertex buffers: range merge and ObtainBuffer
-    u64 vi_bind_ns;         ///< Vertex buffers: bindVertexBuffers
-    u64 index_ns;           ///< BindIndexBuffer
-    u64 cmd_record_ns;      ///< Draw offsets, bindPipeline and draw call
-    u64 reset_images_ns;    ///< ResetBindings: bound images
-    u64 reset_buffers_ns;   ///< ResetBindings: AccessBuffer of bound buffers
-    u32 bound_buffers;      ///< Buffers tracked for barriers
-    u32 bound_images;
-    u32 tex_lookups;
-    u32 tex_hits;
-    u32 rb_downloads; ///< Buffer readbacks downloaded
-    u64 rb_bytes;
-    u64 rb_finish_ns; ///< Host GPU drains for buffer readbacks
-    u32 img_downloads;
-    u64 img_finish_ns; ///< Host GPU drains for linear image readbacks
-};
-inline CpPerf cp_perf;
-
-/// Time guest threads spend waiting for a buffer readback done by the GPU thread.
-struct ReadbackWaitPerf {
-    std::atomic<u64> count;
-    std::atomic<u64> wait_ns;
-    std::atomic<u64> max_ns;
-};
-inline ReadbackWaitPerf readback_wait;
-
-/// Adds the lifetime of the object to a CpPerf field.
-struct CpPerfScope {
-    explicit CpPerfScope(u64& field_) : field{field_}, t0{PerfNs()} {}
-    ~CpPerfScope() {
-        field += PerfNs() - t0;
-    }
-    u64& field;
-    u64 t0;
-};
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;

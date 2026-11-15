@@ -18,8 +18,6 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
 
-using AmdGpu::PerfNs;
-
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {
     case PixelFormat::A8R8G8B8Srgb:
@@ -241,14 +239,10 @@ void VideoOutDriver::Flip(const Request& req) {
     presenter->SetHDR(req.port->is_hdr);
 
     // Present the frame.
-    const u64 present_t0 = PerfNs();
     presenter->Present(req.frame);
-    const u64 present_t1 = PerfNs();
 
     // Update flip status.
     auto* port = req.port;
-    const s32 prev_index = port->prev_index;
-    u64 label_ns = 0;
     {
         std::unique_lock lock{port->port_mutex};
         auto& flip_status = port->flip_status;
@@ -281,18 +275,12 @@ void VideoOutDriver::Flip(const Request& req) {
             released = --port->buffer_executed[port->prev_index] == 0;
             if (released) {
                 port->buffer_labels[port->prev_index] = 0;
-                label_ns = PerfNs();
             }
         }
         if (released) {
             port->SignalVoLabel();
         }
     }
-    LOG_INFO(Lib_VideoOut,
-             "PERF flip idx={} prev={} arg={} eop={} t_submit={} t_queued={} t_tick={} "
-             "t_present0={} t_present1={} t_label={}",
-             req.index, prev_index, req.flip_arg, req.eop, req.submit_ns, req.queued_ns,
-             vblank_tick_ns, present_t0, present_t1, label_ns);
     // save to prev buf index
     port->prev_index = req.index;
 }
@@ -331,18 +319,15 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        const u64 submit_ns = PerfNs();
-        liverpool->SendCommand(
-            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, submit_ns); });
+        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop, PerfNs());
+        SubmitFlipInternal(port, index, flip_arg, is_eop);
     }
 
     return true;
 }
 
-void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
-                                        u64 submit_ns) {
+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -360,8 +345,6 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         .flip_arg = flip_arg,
         .index = index,
         .eop = is_eop,
-        .submit_ns = submit_ns,
-        .queued_ns = PerfNs(),
     });
 }
 
@@ -386,7 +369,6 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     while (!token.stop_requested()) {
         timer.Start();
-        vblank_tick_ns = PerfNs();
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();

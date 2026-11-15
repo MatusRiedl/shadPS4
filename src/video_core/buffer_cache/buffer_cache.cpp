@@ -159,37 +159,13 @@ void BufferCache::WriteAndUnmarkGpuModified(VAddr device_addr, const u8* data, u
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool async,
                              bool assume_locks) {
     ReadbackStats stats{};
-    const u64 rb_t0 = AmdGpu::PerfNs();
-    // 0: on the calling thread, 1: sent to the GPU thread, 2: already on the GPU thread.
-    u32 path = 0;
     if (assume_locks) {
-        path = 2;
         ReadMemoryOnGpuThread(device_addr, size, is_write, async, stats);
     } else if (async || !ReadMemoryOnCallingThread(device_addr, size, is_write, stats)) {
-        path = 1;
         liverpool->SendCommand<true>([this, device_addr, size, is_write, async, &stats] {
-            stats.exec_t0 = AmdGpu::PerfNs();
             ReadMemoryOnGpuThread(device_addr, size, is_write, async, stats);
         });
     }
-    const u64 rb_t1 = AmdGpu::PerfNs();
-    if (!assume_locks) {
-        const u64 wait_ns = rb_t1 - rb_t0;
-        auto& perf = AmdGpu::readback_wait;
-        perf.count.fetch_add(1, std::memory_order_relaxed);
-        perf.wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
-        u64 prev = perf.max_ns.load(std::memory_order_relaxed);
-        while (prev < wait_ns &&
-               !perf.max_ns.compare_exchange_weak(prev, wait_ns, std::memory_order_relaxed)) {
-        }
-    }
-    LOG_INFO(Render,
-             "PERF rb addr={:#x} size={:#x} write={} gpu_thread={} path={} t0={} t1={} "
-             "exec_t0={} in_flight_us={} ahead={} batch_windows={} dl_bytes={} wait_tick={} "
-             "gpu_tick={} gpu_us={} thread={}",
-             device_addr, size, is_write, assume_locks, path, rb_t0, rb_t1, stats.exec_t0,
-             stats.in_flight_ns / 1000, stats.ahead, stats.windows, stats.bytes, stats.wait_tick,
-             stats.gpu_tick, stats.gpu_ns / 1000, Common::GetCurrentThreadName());
 }
 
 bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is_write,
@@ -246,10 +222,6 @@ void BufferCache::ReadMemoryOnGpuThread(VAddr device_addr, u64 size, bool is_wri
         DownloadAhead(lk, windows, stats);
     } else {
         DownloadMemory(lk, arena, window.start, window.size, async, stats);
-    }
-    if (stats.bytes != 0) {
-        ++AmdGpu::cp_perf.rb_downloads;
-        AmdGpu::cp_perf.rb_bytes += stats.bytes;
     }
     FinishReadback(lk, device_addr, size, is_write, stats);
 }
@@ -340,9 +312,7 @@ bool BufferCache::WaitDownloadsInFlight(std::unique_lock<std::mutex>& lk, VAddr 
     if (!overlaps()) {
         return false;
     }
-    const u64 wait_t0 = AmdGpu::PerfNs();
     downloads_cv.wait(lk, [&] { return !overlaps(); });
-    stats.in_flight_ns += AmdGpu::PerfNs() - wait_t0;
     return true;
 }
 
@@ -472,10 +442,7 @@ void BufferCache::DownloadMemory(std::unique_lock<std::mutex>& lk, const Buffer*
     if (async) {
         scheduler.DeferOperation(std::move(write_data));
     } else {
-        {
-            const AmdGpu::CpPerfScope perf_finish{AmdGpu::cp_perf.rb_finish_ns};
-            scheduler.Finish();
-        }
+        scheduler.Finish();
         write_data();
     }
     lk.lock();
@@ -566,12 +533,9 @@ void BufferCache::DownloadAhead(std::unique_lock<std::mutex>& lk,
     Vulkan::Check<"end readback command buffer">(cmdbuf.end());
     auto* const work_semaphore = scheduler.GetWorkSemaphore();
     work_semaphore->Refresh();
-    stats.gpu_tick = work_semaphore->KnownGpuTick();
-    const u64 gpu_t0 = AmdGpu::PerfNs();
     scheduler.SubmitOutOfBand(cmdbuf, *context->fence, wait_tick);
     Vulkan::Check<"wait for readback">(
         device.waitForFences(*context->fence, true, std::numeric_limits<u64>::max()));
-    stats.gpu_ns = AmdGpu::PerfNs() - gpu_t0;
     Vulkan::Check<"reset readback fence">(device.resetFences(*context->fence));
 
     context->staging->Invalidate(0, total_size_bytes);
@@ -646,19 +610,14 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const bool is_written = True(flags & ObtainBufferFlags::IsWritten);
     const bool is_texel_buffer = True(flags & ObtainBufferFlags::IsTexelBuffer);
     const bool skip_stream_buffer = True(flags & ObtainBufferFlags::IgnoreStreamBuffer);
-    ++AmdGpu::cp_perf.obtains;
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && !skip_stream_buffer && size <= STREAM_THRESHOLD &&
         !IsRegionGpuModified(device_addr, size)) {
-        ++AmdGpu::cp_perf.obtain_stream;
-        AmdGpu::cp_perf.obtain_stream_bytes += size;
         auto& copy = stream_copies[StreamCopySlot(device_addr, size)];
         if (copy.tick == scheduler.CurrentTick() && copy.device_addr == device_addr &&
             copy.size == size &&
             memory->CompareSparseMemory(device_addr, stream_shadow.data() + copy.shadow_offset,
                                         size)) {
-            ++AmdGpu::cp_perf.obtain_stream_reused;
-            AmdGpu::cp_perf.obtain_stream_reused_bytes += size;
             return {&stream_buffer, copy.stream_offset};
         }
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
@@ -686,7 +645,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
     if (is_written) {
-        ++AmdGpu::cp_perf.obtain_written;
         texture_cache.MarkAsMaybeGpuDirty(device_addr, size);
     }
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
@@ -942,8 +900,6 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
     }
     if (!copies.empty()) {
-        ++AmdGpu::cp_perf.obtain_uploads;
-        AmdGpu::cp_perf.obtain_upload_bytes += total_size_bytes;
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {
             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
@@ -954,10 +910,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         runtime.CopyBuffer(staging.buffer, arena, copies);
     }
     if (is_texel_buffer && !is_written) {
-        ++AmdGpu::cp_perf.obtain_texel;
-        const bool from_image = SynchronizeMemoryFromImage(arena, device_addr, size);
-        AmdGpu::cp_perf.obtain_texel_image += from_image ? 1 : 0;
-        return from_image;
+        return SynchronizeMemoryFromImage(arena, device_addr, size);
     }
     return false;
 }

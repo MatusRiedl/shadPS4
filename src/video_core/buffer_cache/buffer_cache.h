@@ -161,12 +161,8 @@ private:
         u64 size;
     };
     struct ReadbackStats {
-        u64 exec_t0;      ///< When the GPU thread started the readback, 0 if it did not run it
-        u64 in_flight_ns; ///< Time spent waiting for overlapping downloads in flight
         u64 bytes;
         u64 wait_tick; ///< Tick of the last GPU write to the downloaded windows
-        u64 gpu_tick;  ///< Tick the GPU had reached when the download was submitted
-        u64 gpu_ns;    ///< Download submit to fence signalled
         u32 windows;
         bool ahead;
     };
