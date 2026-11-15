@@ -11,6 +11,20 @@
 //   OVERTIME_GC_SECONDS   the texture collector ages images in seconds (20 / 5 / 1) instead of
 //                         guest submissions, and cards under 8 GB get its marks at 70 / 85 / 95 %
 //                         of the driver's current budget (the rule of thegh0sts' native port)
+// Overtime Native v2 (the startup line "Overtime Native v2 switches" logs each state):
+//   OVERTIME_RB_GUEST     a readback whose GPU writes were all submitted copies on a second queue,
+//                         waiting only for the last write (on the faulting guest thread when it
+//                         can), instead of the GPU thread draining the whole GPU (Kravickas)
+//   OVERTIME_LOOKUP_MEMO  draws reuse the last render target, depth and texture lookup when the
+//                         registers / T# and the texture cache registry are unchanged (Kravickas)
+//   OVERTIME_STREAM_REUSE a read-only binding equal to an earlier copy of the same range in the
+//                         same command buffer reuses that copy (Kravickas)
+//   OVERTIME_THREAD_PRIORITY  game Main/Sim/Render/Audio threads above normal, GPU command
+//                         processor highest, present thread above normal (Windows)
+//   OVERTIME_ASYNC_PIPELINES  a new graphics pipeline of a busy frame is built on worker threads;
+//                         its draws are skipped until it is ready
+//   OVERTIME_VK_RECORDER  draw commands are recorded into the Vulkan command buffer by a second
+//                         thread while the GPU thread processes the next draws
 
 #pragma once
 

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include "common/logging/log.h"
+#include "common/overtime_switch.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -26,6 +28,9 @@
 #include <xxhash.h>
 
 namespace Vulkan {
+
+// Overtime switch, see common/overtime_switch.h.
+static const bool lookup_memo = Overtime::SwitchOn("OVERTIME_LOOKUP_MEMO");
 
 template <typename T>
 static bool SameBits(const T& a, const T& b) {
@@ -57,6 +62,14 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
+    LOG_INFO(Core,
+             "Overtime Native v2 switches: RB_GUEST={} (readback queue: {}) LOOKUP_MEMO={} "
+             "STREAM_REUSE={} THREAD_PRIORITY={} ASYNC_PIPELINES={} VK_RECORDER={}",
+             Overtime::SwitchOn("OVERTIME_RB_GUEST"), instance.HasReadbackQueue(), lookup_memo,
+             Overtime::SwitchOn("OVERTIME_STREAM_REUSE"),
+             Overtime::SwitchOn("OVERTIME_THREAD_PRIORITY"),
+             Overtime::SwitchOn("OVERTIME_ASYNC_PIPELINES"),
+             Overtime::SwitchOn("OVERTIME_VK_RECORDER"));
     memory->SetRasterizer(this);
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
@@ -137,7 +150,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const auto& hint = liverpool->last_cb_extent[cb];
         auto& lookup = cb_lookups[cb];
         const u64 generation = texture_cache.RegistryGeneration();
-        if (lookup.generation == generation && SameBits(lookup.col_buf, col_buf) &&
+        if (lookup_memo && lookup.generation == generation && SameBits(lookup.col_buf, col_buf) &&
             lookup.hint.raw == hint.raw) {
             desc = lookup.binding.desc;
             image_id = lookup.binding.image_id;
@@ -145,7 +158,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         } else {
             std::construct_at(&desc, col_buf, hint);
             image_id = texture_cache.FindImage(desc);
-            const bool reusable = texture_cache.RegistryGeneration() == generation &&
+            const bool reusable = lookup_memo &&
+                                  texture_cache.RegistryGeneration() == generation &&
                                   texture_cache.IsPerfectMatch(image_id, desc);
             lookup.generation = reusable ? generation : 0;
             lookup.col_buf = col_buf;
@@ -164,7 +178,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         auto& [image_id, desc] = db_desc;
         auto& lookup = db_lookup;
         const u64 generation = texture_cache.RegistryGeneration();
-        if (lookup.generation == generation && SameBits(lookup.depth_buffer, regs.depth_buffer) &&
+        if (lookup_memo && lookup.generation == generation &&
+            SameBits(lookup.depth_buffer, regs.depth_buffer) &&
             SameBits(lookup.depth_view, regs.depth_view) &&
             SameBits(lookup.depth_control, regs.depth_control) &&
             lookup.htile_address == htile_address && lookup.hint.raw == hint.raw) {
@@ -175,7 +190,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
                               htile_address, hint);
             image_id = texture_cache.FindImage(desc);
-            const bool reusable = texture_cache.RegistryGeneration() == generation &&
+            const bool reusable = lookup_memo &&
+                                  texture_cache.RegistryGeneration() == generation &&
                                   texture_cache.IsPerfectMatch(image_id, desc);
             lookup.generation = reusable ? generation : 0;
             lookup.depth_buffer = regs.depth_buffer;
@@ -973,7 +989,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                 : ~0U;
             auto& lookup = texture_lookups[XXH3_64bits(&key, sizeof(key)) % texture_lookups.size()];
             const u64 generation = texture_cache.RegistryGeneration();
-            if (lookup.generation == generation && SameBits(lookup.key, key)) {
+            if (lookup_memo && lookup.generation == generation && SameBits(lookup.key, key)) {
                 desc = lookup.binding.desc;
                 image_id = lookup.binding.image_id;
                 texture_cache.TouchFoundImage(image_id);
@@ -990,7 +1006,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
 
                 image_id = texture_cache.FindImage(desc);
-                const bool reusable = texture_cache.RegistryGeneration() == generation &&
+                const bool reusable = lookup_memo &&
+                                      texture_cache.RegistryGeneration() == generation &&
                                       texture_cache.IsPerfectMatch(image_id, desc);
                 lookup.generation = reusable ? generation : 0;
                 lookup.key = key;

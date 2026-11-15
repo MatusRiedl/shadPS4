@@ -9,6 +9,8 @@
 #include <xxhash.h>
 
 #include "common/alignment.h"
+#include "common/logging/log.h"
+#include "common/overtime_switch.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
@@ -26,6 +28,10 @@
 #include <vk_mem_alloc.h>
 
 namespace VideoCore {
+
+// Overtime switches, see common/overtime_switch.h.
+static const bool rb_guest = Overtime::SwitchOn("OVERTIME_RB_GUEST");
+static const bool stream_reuse = Overtime::SwitchOn("OVERTIME_STREAM_REUSE");
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
@@ -161,7 +167,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     ReadbackStats stats{};
     if (assume_locks) {
         ReadMemoryOnGpuThread(device_addr, size, is_write, async, stats);
-    } else if (async || !ReadMemoryOnCallingThread(device_addr, size, is_write, stats)) {
+    } else if (async || !rb_guest ||
+               !ReadMemoryOnCallingThread(device_addr, size, is_write, stats)) {
         liverpool->SendCommand<true>([this, device_addr, size, is_write, async, &stats] {
             ReadMemoryOnGpuThread(device_addr, size, is_write, async, stats);
         });
@@ -211,7 +218,7 @@ void BufferCache::ReadMemoryOnGpuThread(VAddr device_addr, u64 size, bool is_wri
     WaitDownloadsInFlight(lk, window.start, window.start + window.size, stats);
     // When the GPU writes were all submitted, the download can run ahead of the open command
     // buffer instead of flushing and draining it.
-    const bool ahead = !async && IsGpuWriteSubmitted(window.start, window.size);
+    const bool ahead = rb_guest && !async && IsGpuWriteSubmitted(window.start, window.size);
     if (!async) {
         hot_windows[window.start] = {window.size, scheduler.CurrentTick()};
     }
@@ -534,8 +541,17 @@ void BufferCache::DownloadAhead(std::unique_lock<std::mutex>& lk,
     auto* const work_semaphore = scheduler.GetWorkSemaphore();
     work_semaphore->Refresh();
     scheduler.SubmitOutOfBand(cmdbuf, *context->fence, wait_tick);
-    Vulkan::Check<"wait for readback">(
-        device.waitForFences(*context->fence, true, std::numeric_limits<u64>::max()));
+    // The copy is in flight and its staging buffer is ours: never give up on it. A wait this
+    // long means the GPU is stuck, which the log should show.
+    constexpr u64 WaitSliceNs = 2'000'000'000ULL;
+    for (u32 slices = 1;; ++slices) {
+        const vk::Result wait_result = device.waitForFences(*context->fence, true, WaitSliceNs);
+        if (wait_result != vk::Result::eTimeout) {
+            Vulkan::Check<"wait for readback">(wait_result);
+            break;
+        }
+        LOG_WARNING(Render, "Readback of tick {} still waiting after {} s", wait_tick, slices * 2);
+    }
     Vulkan::Check<"reset readback fence">(device.resetFences(*context->fence));
 
     context->staging->Invalidate(0, total_size_bytes);
@@ -614,7 +630,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (!is_written && !skip_stream_buffer && size <= STREAM_THRESHOLD &&
         !IsRegionGpuModified(device_addr, size)) {
         auto& copy = stream_copies[StreamCopySlot(device_addr, size)];
-        if (copy.tick == scheduler.CurrentTick() && copy.device_addr == device_addr &&
+        if (stream_reuse && copy.tick == scheduler.CurrentTick() && copy.device_addr == device_addr &&
             copy.size == size &&
             memory->CompareSparseMemory(device_addr, stream_shadow.data() + copy.shadow_offset,
                                         size)) {
@@ -627,7 +643,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             stream_shadow_tick = tick;
             stream_shadow_used = 0;
         }
-        if (stream_shadow_used + size <= stream_shadow.size()) {
+        if (stream_reuse && stream_shadow_used + size <= stream_shadow.size()) {
             // The stream buffer gets the very bytes that are kept to compare with.
             u8* const shadow = stream_shadow.data() + stream_shadow_used;
             memory->CopySparseMemory(device_addr, shadow, size);
