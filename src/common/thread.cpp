@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <ctime>
+#include <initializer_list>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <fmt/format.h>
 
@@ -14,6 +16,7 @@
 
 #include "common/error.h"
 #include "common/logging/log.h"
+#include "common/overtime_switch.h"
 #include "common/thread.h"
 #include "ntapi.h"
 #ifdef __APPLE__
@@ -221,16 +224,47 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 
 #ifdef _WIN32
 
+namespace {
+/// Overtime (OVERTIME_THREAD_PRIORITY): the game's Main/Sim/Render/Audio threads above normal (the
+/// rule of thegh0sts' native port; on NHL 19 Game:Main, SimThread, RenderThread and the two
+/// EAAudioCore threads), the GPU command processor highest, the present thread above normal.
+/// Other names keep the priority they have.
+void ApplyOvertimePriority(HANDLE thread, std::string_view name) {
+    static const bool enabled = Overtime::SwitchOn("OVERTIME_THREAD_PRIORITY");
+    if (!enabled) {
+        return;
+    }
+    int priority;
+    if (name == "shadPS4:GpuCommandProcessor") {
+        priority = THREAD_PRIORITY_HIGHEST;
+    } else if (name == "shadPS4:PresentThread" ||
+               std::ranges::any_of(std::initializer_list<std::string_view>{
+                                       "Main", "main", "Sim", "Render", "Audio", "audio", "Sound"},
+                                   [name](std::string_view key) {
+                                       return name.find(key) != std::string_view::npos;
+                                   })) {
+        priority = THREAD_PRIORITY_ABOVE_NORMAL;
+    } else {
+        return;
+    }
+    if (!SetThreadPriority(thread, priority)) {
+        LOG_WARNING(Common, "Thread priority for {} not set: {}", name, GetLastErrorMsg());
+    }
+}
+} // Anonymous namespace
+
 // Sets the debugger-visible name of the current thread.
 void SetCurrentThreadName(const char* name) {
     if (Libraries::Kernel::g_curthread) {
         Libraries::Kernel::g_curthread->name = name;
     }
     SetThreadDescription(GetCurrentThread(), UTF8ToUTF16W(name).data());
+    ApplyOvertimePriority(GetCurrentThread(), name);
 }
 
 void SetThreadName(void* thread, const char* name) {
     SetThreadDescription(thread, UTF8ToUTF16W(name).data());
+    ApplyOvertimePriority(thread, name);
 }
 
 #else // !_WIN32, so must be POSIX threads
