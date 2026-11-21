@@ -8,6 +8,7 @@
 #include "core/emulator_settings.h"
 
 #include "video_core/cache_storage.h"
+#include "video_core/renderer_vulkan/host_passes/picture.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
@@ -96,9 +97,12 @@ void DataBase::Open() {
     const auto& game_info = Common::ElfInfo::Instance();
 
     using namespace Common::FS;
-    // Overtime Native v3's pipeline cache profile is larger than v2's and the Kravickas build's, which
-    // ignore an incompatible cache without rewriting it. Its own folder keeps their caches intact.
-    const std::string cache_name = std::string{game_info.GameSerial()} + "-v3";
+    // Overtime Native v3 deletes a cache whose profile doesn't match and starts over (#4929); v2 and the
+    // Kravickas build keep such a cache and ignore it. Its own folder keeps their caches intact. The
+    // motion inputs' capture changes the profile, so they get a second folder: switching a picture
+    // option on or off then doesn't throw away the other cache.
+    const std::string cache_name = std::string{game_info.GameSerial()} +
+                                   (Vulkan::HostPasses::Picture::MotionInputs() ? "-v3-mv" : "-v3");
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_zero_struct(&zip_ar);
 
