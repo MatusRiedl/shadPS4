@@ -12,6 +12,8 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/host_passes/dlss_nr_pass.h"
+#include "video_core/renderer_vulkan/host_passes/picture.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -239,7 +241,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 40> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -318,6 +320,22 @@ bool Instance::CreateDevice() {
             add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     }
     provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    // Overtime Native v3: only when a picture option reads the motion inputs, so the device is
+    // v2's with every option off.
+    transform_feedback = HostPasses::Picture::MotionInputs() &&
+                         add_extension(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
+    // Fixed at device creation, so requested only when the Neural Rendering model is installed.
+    if (HostPasses::Picture::DlssNr() && HostPasses::DlssNrPass::ModelPresent()) {
+        const bool binary_import = add_extension("VK_NVX_binary_import");
+        const bool image_view_handle = add_extension("VK_NVX_image_view_handle");
+        neural_rendering = binary_import && image_view_handle;
+    }
+    if (transform_feedback) {
+        const auto chain =
+            physical_device.getProperties2<vk::PhysicalDeviceProperties2,
+                                           vk::PhysicalDeviceTransformFeedbackPropertiesEXT>();
+        transform_feedback_props = chain.get<vk::PhysicalDeviceTransformFeedbackPropertiesEXT>();
+    }
     shader_stencil_export = add_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
     image_load_store_lod = add_extension(VK_AMD_SHADER_IMAGE_LOAD_STORE_LOD_EXTENSION_NAME);
     amd_gcn_shader = add_extension(VK_AMD_GCN_SHADER_EXTENSION_NAME);
@@ -511,6 +529,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceProvokingVertexFeaturesEXT{
             .provokingVertexLast = true,
         },
+        vk::PhysicalDeviceTransformFeedbackFeaturesEXT{
+            .transformFeedback = true,
+        },
         vk::PhysicalDeviceVertexAttributeDivisorFeatures{
             .vertexAttributeInstanceRateDivisor = true,
         },
@@ -587,6 +608,9 @@ bool Instance::CreateDevice() {
     }
     if (!maintenance_6) {
         device_chain.unlink<vk::PhysicalDeviceMaintenance6FeaturesKHR>();
+    }
+    if (!transform_feedback) {
+        device_chain.unlink<vk::PhysicalDeviceTransformFeedbackFeaturesEXT>();
     }
     if (!maintenance_8) {
         device_chain.unlink<vk::PhysicalDeviceMaintenance8FeaturesKHR>();

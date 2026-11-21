@@ -21,6 +21,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/host_passes/picture.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 
@@ -484,7 +485,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         free_queue.push(&frame);
     }
 
-    fsr_settings.enable = EmulatorSettings.IsFsrEnabled();
+    fsr_settings.enable = HostPasses::Picture::Fsr1();
     fsr_settings.use_rcas = EmulatorSettings.IsRcasEnabled();
     fsr_settings.rcas_attenuation =
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
@@ -665,6 +666,10 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    // The flip is the frame boundary in the guest command stream: every draw before it belongs to
+    // the frame being presented.
+    rasterizer->EndXfbFrame({attribute.attrib.width, attribute.attrib.height});
+
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
@@ -734,6 +739,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
     }
 
+    rasterizer->EvaluateNr(image);
+
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
     runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -768,6 +775,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 }
 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
+    if (!present_thread) {
+        rasterizer->EndXfbFrame({});
+    }
+
     // Request a free presentation frame.
     Frame* frame = GetRenderFrame();
 
