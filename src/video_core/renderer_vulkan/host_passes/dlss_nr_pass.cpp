@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/renderer_vulkan/host_passes/dlss_nr_pass.h"
+#include "video_core/renderer_vulkan/host_passes/picture.h"
 
 #if defined(_WIN32) && defined(_MSC_VER)
 
@@ -715,3 +716,11 @@ void DlssNrPass::Render(VideoCore::Image&, const XfbVelocityPass::Outputs&) {}
 } // namespace Vulkan::HostPasses
 
 #endif
+
+namespace Vulkan::HostPasses::Picture {
+
+bool NgxExtensions() {
+    return DlssSr() || (DlssNr() && DlssNrPass::ModelPresent());
+}
+
+} // namespace Vulkan::HostPasses::Picture

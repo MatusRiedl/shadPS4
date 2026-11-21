@@ -7,6 +7,8 @@
 
 #include <array>
 #include <filesystem>
+#include <string>
+#include <string_view>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -37,8 +39,28 @@ bool Succeeded(Ngx::Result result) {
     return (static_cast<unsigned>(result) & 0xFFF00000u) != 0xBAD00000u;
 }
 
+// The driver core's entry points (the SDK's loader passes the FeatureCommonInfo last).
 using PfnInitExt = Ngx::Result (*)(unsigned long long, const wchar_t*, VkInstance,
-                                   VkPhysicalDevice, VkDevice, int, const void*);
+                                   VkPhysicalDevice, VkDevice, int, const Ngx::FeatureCommonInfo*);
+using PfnInitProjectId = Ngx::Result (*)(const char*, int, const char*, const wchar_t*, VkInstance,
+                                         VkPhysicalDevice, VkDevice, int,
+                                         const Ngx::FeatureCommonInfo*);
+// Overtime Native v3's NGX project id (an application without an NVIDIA application id).
+constexpr const char* ProjectId = "c0ccf467-203f-4f44-be52-5bc029d02ab8";
+
+void NgxLog(const char* message, int, int) {
+    std::string_view line{message ? message : ""};
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+        line.remove_suffix(1);
+    }
+    LOG_INFO(Render_Vulkan, "NGX: {}", line);
+}
+
+std::wstring ExecutableDir() {
+    std::array<wchar_t, 32768> path{};
+    const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    return std::filesystem::path{std::wstring{path.data(), length}}.parent_path().wstring();
+}
 using PfnParameters = Ngx::Result (*)(Ngx::Parameter**);
 using PfnDestroy = Ngx::Result (*)(Ngx::Parameter*);
 using PfnCreate1 = Ngx::Result (*)(VkDevice, VkCommandBuffer, int, Ngx::Parameter*, void**);
@@ -89,6 +111,9 @@ struct DlssSrPass::Impl {
     Runtime& runtime;
 
     HMODULE core{};
+    std::wstring exe_dir;
+    const wchar_t* exe_dir_ptr{};
+    Ngx::FeatureCommonInfo common{};
     PfnDestroy destroy{};
     PfnCreate1 create{};
     PfnEvaluate evaluate{};
@@ -137,11 +162,34 @@ bool DlssSrPass::Impl::Initialise() {
         return false;
     }
     const auto data_path = Common::FS::GetUserPath(Common::FS::PathType::LogDir).wstring();
-    const Ngx::Result init_result = init(
-        0, data_path.c_str(), static_cast<VkInstance>(instance.GetInstance()),
-        static_cast<VkPhysicalDevice>(instance.GetPhysicalDevice()),
-        static_cast<VkDevice>(instance.GetDevice()), Ngx::VersionApi, nullptr);
-    LOG_INFO(Render_Vulkan, "DLSS: NGX init {:#x}", static_cast<u32>(init_result));
+    // The player's nvngx_dlss.dll sits beside the executable; NGX's log lines go to ours.
+    exe_dir = ExecutableDir();
+    exe_dir_ptr = exe_dir.c_str();
+    common = Ngx::FeatureCommonInfo{
+        .paths = &exe_dir_ptr,
+        .path_count = 1,
+        .internal_data = nullptr,
+        .log_callback = NgxLog,
+        .minimum_log_level = 1,
+        .disable_other_sinks = false,
+    };
+    const auto vk_instance = static_cast<VkInstance>(instance.GetInstance());
+    const auto physical = static_cast<VkPhysicalDevice>(instance.GetPhysicalDevice());
+    const auto device = static_cast<VkDevice>(instance.GetDevice());
+    Ngx::Result init_result = 0;
+    const auto init_project =
+        reinterpret_cast<PfnInitProjectId>(GetProcAddress(core, "NVSDK_NGX_VULKAN_Init_ProjectID"));
+    if (init_project) {
+        init_result = init_project(ProjectId, Ngx::EngineTypeCustom, "1.0", data_path.c_str(),
+                                   vk_instance, physical, device, Ngx::VersionApi, &common);
+        LOG_INFO(Render_Vulkan, "DLSS: NGX init (project id) {:#x}",
+                 static_cast<u32>(init_result));
+    }
+    if (!init_project || !Succeeded(init_result)) {
+        init_result = init(0, data_path.c_str(), vk_instance, physical, device, Ngx::VersionApi,
+                           &common);
+        LOG_INFO(Render_Vulkan, "DLSS: NGX init {:#x}", static_cast<u32>(init_result));
+    }
     if (!Succeeded(init_result)) {
         Fail("NGX would not initialise on this device");
         return false;
@@ -156,8 +204,11 @@ bool DlssSrPass::Impl::Initialise() {
     int needs_driver = 0;
     parameters->Get("SuperSampling.Available", &available);
     parameters->Get("SuperSampling.NeedsUpdatedDriver", &needs_driver);
-    LOG_INFO(Render_Vulkan, "DLSS: Super Resolution available {}, needs a newer driver {}",
-             available, needs_driver);
+    int feature_init = 0;
+    parameters->Get("SuperSampling.FeatureInitResult", &feature_init);
+    LOG_INFO(Render_Vulkan,
+             "DLSS: Super Resolution available {}, needs a newer driver {}, feature init {:#x}",
+             available, needs_driver, static_cast<u32>(feature_init));
     if (!available) {
         Fail("DLSS Super Resolution is not available (an RTX GPU and nvngx_dlss.dll beside the "
              "executable are needed)");

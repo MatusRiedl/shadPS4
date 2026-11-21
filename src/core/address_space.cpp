@@ -16,6 +16,7 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/memory.h"
 #include "core/memory.h"
+#include "video_core/renderer_vulkan/host_passes/picture.h"
 #include "libraries/error_codes.h"
 
 #ifdef _WIN32
@@ -173,6 +174,36 @@ struct AddressSpace::Impl {
                 regions.emplace(addr,
                                 MemoryRegion{addr, PAddr(-1), size, PAGE_NOACCESS, -1, false});
             }
+        }
+
+        // Overtime Native v3: DLSS's device extensions start CUDA in vkCreateDevice, which faults when
+        // the guest has reserved all free space below 1 TB. Leave it a hole the guest does not use
+        // (NHL 19 maps at 0x7000000000 and 0xfbffffc000, both outside), so guest addresses stay as
+        // with DLSS off. The memory manager builds its map from these regions and skips the hole.
+        if (Vulkan::HostPasses::Picture::NgxExtensions()) {
+            constexpr VAddr hole_lo = Vulkan::HostPasses::Picture::CudaWindowBase;
+            constexpr VAddr hole_hi = Vulkan::HostPasses::Picture::CudaWindowEnd;
+            std::map<VAddr, MemoryRegion> kept;
+            for (const auto& [base, region] : regions) {
+                const VAddr end = region.base + region.size;
+                if (end <= hole_lo || region.base >= hole_hi) {
+                    kept.emplace(base, region);
+                    continue;
+                }
+                if (region.base < hole_lo) {
+                    MemoryRegion low = region;
+                    low.size = hole_lo - region.base;
+                    kept.emplace(low.base, low);
+                }
+                if (end > hole_hi) {
+                    MemoryRegion high = region;
+                    high.base = hole_hi;
+                    high.size = end - hole_hi;
+                    kept.emplace(high.base, high);
+                }
+            }
+            regions = std::move(kept);
+            LOG_INFO(Core, "DLSS: {:#x} - {:#x} left free for CUDA", hole_lo, hole_hi);
         }
 
         // Reserve all detected free regions.

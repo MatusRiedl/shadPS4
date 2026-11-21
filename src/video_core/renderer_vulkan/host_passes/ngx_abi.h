@@ -18,6 +18,20 @@ using Result = int;
 constexpr Result Success = 1;
 constexpr int VersionApi = 0x15;
 constexpr int FeatureNeuralRendering = 18;
+constexpr int EngineTypeCustom = 0;
+
+// NVSDK_NGX_FeatureCommonInfo (API 0x14 and later), flattened: the folders searched for a feature
+// DLL besides the application's own, an internal pointer, then the log sink (level 0 off, 1 on,
+// 2 verbose).
+using AppLogCallback = void (*)(const char* message, int level, int source);
+struct FeatureCommonInfo {
+    const wchar_t* const* paths;
+    unsigned int path_count;
+    void* internal_data;
+    AppLogCallback log_callback;
+    int minimum_log_level;
+    bool disable_other_sinks;
+};
 
 // The virtual order is the ABI: eight setters, eight getters, then Reset, each group in NVIDIA's
 // declaration order. Compiled for the MSVC ABI this yields the slots the driver's block uses.

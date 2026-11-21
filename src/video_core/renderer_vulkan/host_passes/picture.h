@@ -46,4 +46,13 @@ inline bool MotionInputs() {
     return DlssSr() || DlssNr() || DlssFg() || EmulatorSettings.IsMotionDebug();
 }
 
+/// NGX's device extensions (VK_NVX_binary_import starts CUDA in vkCreateDevice): for DLSS Super
+/// Resolution, or for DLSS 5 when its model is installed. Fixed before the guest address space.
+bool NgxExtensions();
+
+/// With NGX's extensions the guest leaves this range free, so CUDA has room below 1 TB (it faults
+/// in vkCreateDevice when the guest has reserved all of that).
+constexpr unsigned long long CudaWindowBase = 0x8000000000ULL;
+constexpr unsigned long long CudaWindowEnd = 0xF000000000ULL;
+
 } // namespace Vulkan::HostPasses::Picture
