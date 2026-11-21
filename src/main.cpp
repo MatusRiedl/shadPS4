@@ -32,9 +32,29 @@
 #include <sys/sysctl.h>
 #endif
 
+#ifdef OVERTIME_PGO_GEN
+// Profile-guided build, training exe only: the benchmark ends the emulator by killing it, so the
+// profile runtime never reaches its exit hook. Write the counters every 10 s instead (each write
+// replaces the file named by LLVM_PROFILE_FILE with the counts so far).
+#include <chrono>
+#include <thread>
+extern "C" int __llvm_profile_write_file(void);
+static void StartProfileWriter() {
+    std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            __llvm_profile_write_file();
+        }
+    }).detach();
+}
+#endif
+
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
+#endif
+#ifdef OVERTIME_PGO_GEN
+    StartProfileWriter();
 #endif
 
 #if defined(__APPLE__) && defined(ARCH_X86_64)
