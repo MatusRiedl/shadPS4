@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <concepts>
 #include <iterator>
+#include <type_traits>
 #include <vector>
 
+#include "common/overtime_switch.h"
 #include "common/small_vector.h"
 #include "common/types.h"
 
@@ -68,6 +70,15 @@ public:
         std::size_t m = 0;
 
         auto [first, last] = OverlapRun(value.start, value.end);
+        if constexpr (std::is_same_v<IV, Interval>) {
+            // Overtime: a range inside one interval leaves the set as it is. Without this the
+            // split and the merge after it move the rest of the list four times, which the
+            // per-draw buffer access lists pay for every binding (OVERTIME_INTERVAL_FAST).
+            static const bool fast = Overtime::SwitchOn("OVERTIME_INTERVAL_FAST");
+            if (fast && first != last && first->start <= value.start && value.end <= first->end) {
+                return;
+            }
+        }
         if (first != last) {
             if (first->start < value.start) {
                 out[m++] = first->SubRange(first->start, value.start);

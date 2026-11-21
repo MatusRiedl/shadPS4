@@ -19,6 +19,8 @@
 //                         GPU thread only submit that buffer and copies on the faulting guest
 //                         thread, instead of the GPU thread draining the whole GPU (with RB_GUEST)
 //   OVERTIME_RB_STATS     diagnostic, off unless "1": a log line every 5 s counts readbacks by path
+//   OVERTIME_INTERVAL_FAST  adding a range that one interval of a plain interval list already holds
+//                         returns at once, instead of splitting and merging it again (same result)
 //   OVERTIME_LOOKUP_MEMO  draws reuse the last render target, depth and texture lookup when the
 //                         registers / T# and the texture cache registry are unchanged (Kravickas)
 //   OVERTIME_STREAM_REUSE a read-only binding equal to an earlier copy of the same range in the
