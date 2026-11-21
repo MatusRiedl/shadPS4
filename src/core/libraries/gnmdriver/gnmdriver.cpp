@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
+
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -88,6 +91,27 @@ static void WaitGpuIdle() {
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+}
+
+// Overtime experiment, off by default: OVERTIME_SUBMIT_AHEAD=K lets the first K command buffer
+// submissions after sceGnmSubmitDone go to the GPU without waiting for the previous frame's work
+// (the submission lock); later ones wait as before. The guest then builds the next frame while the
+// GPU finishes the previous one. Idea: thegh0sts' NHL-19-PS4-PORT-WINDOWS (BB_SUBMIT_AHEAD, found on
+// UFC 3 / Bloodborne, where 8 or more leaked the game's heap). Guest timing: not for online play
+// until a pair run says otherwise. Called with m_submit_lock held.
+static u32 submits_since_done{};
+static u32 SubmitAhead() {
+    static const u32 ahead = [] {
+        const char* env = std::getenv("OVERTIME_SUBMIT_AHEAD");
+        return env ? static_cast<u32>(std::clamp(std::atoi(env), 0, 7)) : 0u;
+    }();
+    return ahead;
+}
+static void WaitGpuIdleAtSubmit() {
+    if (++submits_since_done <= SubmitAhead()) {
+        return;
+    }
+    WaitGpuIdle();
 }
 
 // Write a special NOP packet with N DWs data block
@@ -2456,7 +2480,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
     }
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    WaitGpuIdleAtSubmit();
 
     return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
                          const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
@@ -2474,6 +2498,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
+    submits_since_done = 0;
     if (!liverpool->IsGpuIdle()) {
         submission_lock = true;
     }
