@@ -45,8 +45,7 @@ using PfnInitExt = Ngx::Result (*)(unsigned long long, const wchar_t*, VkInstanc
 using PfnInitProjectId = Ngx::Result (*)(const char*, int, const char*, const wchar_t*, VkInstance,
                                          VkPhysicalDevice, VkDevice, int,
                                          const Ngx::FeatureCommonInfo*);
-// Overtime Native v3's NGX project id (an application without an NVIDIA application id).
-constexpr const char* ProjectId = "c0ccf467-203f-4f44-be52-5bc029d02ab8";
+using Ngx::ProjectId;
 
 void NgxLog(const char* message, int, int) {
     std::string_view line{message ? message : ""};

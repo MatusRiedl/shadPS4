@@ -19,6 +19,10 @@ constexpr Result Success = 1;
 constexpr int VersionApi = 0x15;
 constexpr int FeatureNeuralRendering = 18;
 constexpr int EngineTypeCustom = 0;
+// Overtime Native v3's NGX project id (an application without an NVIDIA application id). Both
+// passes start NGX with it: the first start on a device sticks, and with application id 0 the
+// driver reports Super Resolution unavailable.
+constexpr const char* ProjectId = "c0ccf467-203f-4f44-be52-5bc029d02ab8";
 
 // NVSDK_NGX_FeatureCommonInfo (API 0x14 and later), flattened: the folders searched for a feature
 // DLL besides the application's own, an internal pointer, then the log sink (level 0 off, 1 on,

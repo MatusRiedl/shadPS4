@@ -43,6 +43,9 @@ using PfnEvaluate = int (*)(void*, void*, void*);
 using PfnRelease = int (*)(void*);
 using PfnCoreInit = Ngx::Result (*)(unsigned long long, const wchar_t*, VkInstance,
                                     VkPhysicalDevice, VkDevice, int, const void*);
+using PfnCoreInitProjectId = Ngx::Result (*)(const char*, int, const char*, const wchar_t*,
+                                             VkInstance, VkPhysicalDevice, VkDevice, int,
+                                             const void*);
 using PfnCoreParameters = Ngx::Result (*)(Ngx::Parameter**);
 using PfnCoreDestroy = Ngx::Result (*)(Ngx::Parameter*);
 
@@ -223,6 +226,11 @@ struct DlssNrPass::Impl {
     HMODULE core{};
     PfnCoreDestroy core_destroy{};
     Ngx::Parameter* core_parameters{};
+    // The folder the DLSS pass's nvngx_dlss.dll sits in: whichever pass starts NGX first decides
+    // where the driver looks for feature DLLs, so this one names it too.
+    std::wstring feature_dir;
+    const wchar_t* feature_dir_ptr{};
+    Ngx::FeatureCommonInfo common{};
     OwnParameters own_parameters;
     Ngx::Parameter* parameters{};
     void* feature{};
@@ -296,9 +304,30 @@ bool DlssNrPass::Impl::Initialise() {
         core_destroy = reinterpret_cast<PfnCoreDestroy>(
             GetProcAddress(core, "NVSDK_NGX_VULKAN_DestroyParameters"));
         if (core_init && core_allocate) {
-            const Ngx::Result core_result =
-                core_init(0, data_path.c_str(), vk_instance, physical_device, device,
-                          Ngx::VersionApi, nullptr);
+            feature_dir = ExecutableDir().wstring();
+            feature_dir_ptr = feature_dir.c_str();
+            common = Ngx::FeatureCommonInfo{
+                .paths = &feature_dir_ptr,
+                .path_count = 1,
+                .internal_data = nullptr,
+                .log_callback = nullptr,
+                .minimum_log_level = 0,
+                .disable_other_sinks = false,
+            };
+            // The DLSS pass's start (project id, the executable's folder): when this pass starts
+            // NGX first, DLSS Super Resolution still finds its feature afterwards.
+            const auto core_init_project = reinterpret_cast<PfnCoreInitProjectId>(
+                GetProcAddress(core, "NVSDK_NGX_VULKAN_Init_ProjectID"));
+            Ngx::Result core_result = 0;
+            if (core_init_project) {
+                core_result = core_init_project(Ngx::ProjectId, Ngx::EngineTypeCustom, "1.0",
+                                                data_path.c_str(), vk_instance, physical_device,
+                                                device, Ngx::VersionApi, &common);
+            }
+            if (!core_init_project || core_result != Ngx::Success) {
+                core_result = core_init(0, data_path.c_str(), vk_instance, physical_device,
+                                        device, Ngx::VersionApi, &common);
+            }
             LOG_INFO(Render_Vulkan, "DLSS NR: NGX core init {:#x}", static_cast<u32>(core_result));
             if (core_result == Ngx::Success) {
                 const Ngx::Result allocate_result = core_allocate(&core_parameters);
