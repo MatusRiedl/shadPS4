@@ -43,7 +43,8 @@ namespace {
 struct RbCounters {
     std::atomic<u64> calls, writes, gpu_own, caller_ok, caller_none, caller_two_arenas, caller_open,
         gpu_ahead, gpu_drain, gpu_async, bytes, windows, guest_wait_us, gpu_ahead_us, gpu_drain_us,
-        written_binds, written_bytes, written_big, flushes, flush_open_again, invalidations;
+        written_binds, written_bytes, written_big, flushes, flush_open_again, invalidations,
+        flush_us, lock_us, other_download_us, fence_us, copy_us, invalidate_us;
 };
 RbCounters rb_counters{};
 const bool rb_stats = [] {
@@ -84,7 +85,10 @@ void RbMaybeLog() {
               ahead_us = take(c.gpu_ahead_us), drain_us = take(c.gpu_drain_us),
               marks = take(c.written_binds), marked = take(c.written_bytes),
               big_marks = take(c.written_big), flushes = take(c.flushes),
-              open_again = take(c.flush_open_again), invalidations = take(c.invalidations);
+              open_again = take(c.flush_open_again), invalidations = take(c.invalidations),
+              flush_us = take(c.flush_us), lock_us = take(c.lock_us),
+              other_us = take(c.other_download_us), fence_us = take(c.fence_us),
+              copy_us = take(c.copy_us), invalidate_us = take(c.invalidate_us);
     // Warning level so the line shows with the usual log filter; it is only on when asked for.
     LOG_WARNING(Render,
                 "Overtime readbacks in {} ms: {} ({} write faults, {} from the GPU thread); guest "
@@ -92,11 +96,13 @@ void RbMaybeLog() {
                 "arenas; flush-only {}, open again after it {}); GPU thread ahead {} ({} ms), "
                 "drain {} ({} ms), async {}; {} KB in {} windows; guest threads waited {} ms; "
                 "GPU-written binds {} ({} MB, {} over 1 MB); invalidations (write faults, "
-                "unmaps) {}",
+                "unmaps) {}; time in: flush {} ms, readback lock {} ms, other downloads {} ms, "
+                "copy fence {} ms, copy to guest {} ms; invalidations took {} ms",
                 (now - last) / 1000, calls, writes, gpu_own, caller_ok, none, open, two_arenas,
                 flushes, open_again, ahead, ahead_us / 1000, drain, drain_us / 1000, async,
                 bytes / 1024, windows, guest_us / 1000, marks, marked >> 20, big_marks,
-                invalidations);
+                invalidations, flush_us / 1000, lock_us / 1000, other_us / 1000, fence_us / 1000,
+                copy_us / 1000, invalidate_us / 1000);
 }
 } // namespace
 
@@ -209,9 +215,11 @@ void BufferCache::TickFrame() {
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
     RbCount(rb_counters.invalidations);
+    const u64 start_us = rb_stats ? RbNowUs() : 0;
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         ReadMemory(device_addr, size, true, false, assume_locks);
     });
+    RbCount(rb_counters.invalidate_us, rb_stats ? RbNowUs() - start_us : 0);
 }
 
 void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write) {
@@ -246,7 +254,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             // Flush-only: the GPU thread just submits its open command buffer, and the copy then
             // runs on this thread like any readback of submitted writes. The GPU thread goes on
             // with the next commands instead of waiting for the whole GPU to finish.
+            const u64 flush_start = rb_stats ? RbNowUs() : 0;
             liverpool->SendCommand<true>([this] { scheduler.Flush(); });
+            RbCount(rb_counters.flush_us, rb_stats ? RbNowUs() - flush_start : 0);
             stats.open_write = false;
             RbCount(rb_counters.flushes);
             done = ReadMemoryOnCallingThread(device_addr, size, is_write, stats);
@@ -272,7 +282,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 
 bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is_write,
                                             ReadbackStats& stats) {
+    const u64 lock_start = rb_stats ? RbNowUs() : 0;
     std::unique_lock lk{modified_mutex};
+    RbCount(rb_counters.lock_us, rb_stats ? RbNowUs() - lock_start : 0);
     DownloadWindow window;
     do {
         // Arenas are created and merged by the GPU thread, look again after waiting.
@@ -426,7 +438,9 @@ bool BufferCache::WaitDownloadsInFlight(std::unique_lock<std::mutex>& lk, VAddr 
     if (!overlaps()) {
         return false;
     }
+    const u64 wait_start = rb_stats ? RbNowUs() : 0;
     downloads_cv.wait(lk, [&] { return !overlaps(); });
+    RbCount(rb_counters.other_download_us, rb_stats ? RbNowUs() - wait_start : 0);
     return true;
 }
 
@@ -651,6 +665,7 @@ void BufferCache::DownloadAhead(std::unique_lock<std::mutex>& lk,
     // The copy is in flight and its staging buffer is ours: never give up on it. A wait this
     // long means the GPU is stuck, which the log should show.
     constexpr u64 WaitSliceNs = 2'000'000'000ULL;
+    const u64 fence_start = rb_stats ? RbNowUs() : 0;
     for (u32 slices = 1;; ++slices) {
         const vk::Result wait_result = device.waitForFences(*context->fence, true, WaitSliceNs);
         if (wait_result != vk::Result::eTimeout) {
@@ -660,6 +675,8 @@ void BufferCache::DownloadAhead(std::unique_lock<std::mutex>& lk,
         LOG_WARNING(Render, "Readback of tick {} still waiting after {} s", wait_tick, slices * 2);
     }
     Vulkan::Check<"reset readback fence">(device.resetFences(*context->fence));
+    const u64 copy_start = rb_stats ? RbNowUs() : 0;
+    RbCount(rb_counters.fence_us, copy_start - fence_start);
 
     context->staging->Invalidate(0, total_size_bytes);
     const u8* staging_data = context->staging->mapped_data.data();
@@ -670,6 +687,7 @@ void BufferCache::DownloadAhead(std::unique_lock<std::mutex>& lk,
                                     staging_data + copy.dstOffset, copy.size);
         }
     }
+    RbCount(rb_counters.copy_us, rb_stats ? RbNowUs() - copy_start : 0);
     if (context->staging->SizeBytes() > MaxReadbackStagingSize) {
         // Only staging buffers of the usual download size are kept.
         context->staging.reset();
