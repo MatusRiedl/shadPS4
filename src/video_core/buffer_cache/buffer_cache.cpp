@@ -43,7 +43,7 @@ namespace {
 struct RbCounters {
     std::atomic<u64> calls, writes, gpu_own, caller_ok, caller_none, caller_two_arenas, caller_open,
         gpu_ahead, gpu_drain, gpu_async, bytes, windows, guest_wait_us, gpu_ahead_us, gpu_drain_us,
-        written_binds, written_bytes, written_big, flushes, flush_open_again;
+        written_binds, written_bytes, written_big, flushes, flush_open_again, invalidations;
 };
 RbCounters rb_counters{};
 const bool rb_stats = [] {
@@ -84,17 +84,19 @@ void RbMaybeLog() {
               ahead_us = take(c.gpu_ahead_us), drain_us = take(c.gpu_drain_us),
               marks = take(c.written_binds), marked = take(c.written_bytes),
               big_marks = take(c.written_big), flushes = take(c.flushes),
-              open_again = take(c.flush_open_again);
+              open_again = take(c.flush_open_again), invalidations = take(c.invalidations);
     // Warning level so the line shows with the usual log filter; it is only on when asked for.
     LOG_WARNING(Render,
                 "Overtime readbacks in {} ms: {} ({} write faults, {} from the GPU thread); guest "
                 "thread {} + {} not GPU memory (fell back: {} open command buffer, {} two "
                 "arenas; flush-only {}, open again after it {}); GPU thread ahead {} ({} ms), "
                 "drain {} ({} ms), async {}; {} KB in {} windows; guest threads waited {} ms; "
-                "GPU-written binds {} ({} MB, {} over 1 MB)",
+                "GPU-written binds {} ({} MB, {} over 1 MB); invalidations (write faults, "
+                "unmaps) {}",
                 (now - last) / 1000, calls, writes, gpu_own, caller_ok, none, open, two_arenas,
                 flushes, open_again, ahead, ahead_us / 1000, drain, drain_us / 1000, async,
-                bytes / 1024, windows, guest_us / 1000, marks, marked >> 20, big_marks);
+                bytes / 1024, windows, guest_us / 1000, marks, marked >> 20, big_marks,
+                invalidations);
 }
 } // namespace
 
@@ -206,6 +208,7 @@ void BufferCache::TickFrame() {
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
+    RbCount(rb_counters.invalidations);
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         ReadMemory(device_addr, size, true, false, assume_locks);
     });
