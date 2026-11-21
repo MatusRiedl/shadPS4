@@ -699,6 +699,8 @@ std::optional<XfbVelocityPass::Outputs> XfbVelocityPass::FrameOutputs() const {
         .motion_view = *motion_view,
         .depth = depth_out,
         .depth_view = *depth_out_view,
+        .mask = mask_image,
+        .mask_view = *mask_view,
         .size = size,
     };
 }

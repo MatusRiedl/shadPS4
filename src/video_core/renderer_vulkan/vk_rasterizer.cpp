@@ -149,6 +149,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             if (HostPasses::Picture::DlssNr() && instance.IsNeuralRenderingSupported()) {
                 dlss_nr.emplace(instance, scheduler, runtime);
             }
+            if (HostPasses::Picture::DlssSr() && instance.IsNeuralRenderingSupported()) {
+                dlss_sr.emplace(instance, scheduler, runtime);
+            }
+            if (HostPasses::Picture::MotionDebug()) {
+                motion_debug.emplace(instance, scheduler, runtime);
+            }
         }
     }
     if (!EmulatorSettings.IsNullGPU()) {
@@ -668,12 +674,30 @@ void Rasterizer::EndXfbFrame(vk::Extent2D output_extent) {
 }
 
 void Rasterizer::EvaluateNr(VideoCore::Image& color) {
+    if (motion_debug && xfb_velocity) {
+        // The motion view replaces DLSS 5's picture: it shows what DLSS would read.
+        if (const auto outputs = xfb_velocity->FrameOutputs()) {
+            motion_debug->Render(color, *outputs);
+        }
+        return;
+    }
     if (!dlss_nr || !xfb_velocity) {
         return;
     }
     if (const auto outputs = xfb_velocity->FrameOutputs()) {
         dlss_nr->Render(color, *outputs);
     }
+}
+
+vk::ImageView Rasterizer::UpscaleDlss(VideoCore::Image& color, vk::ImageView view,
+                                      vk::Format format, vk::Extent2D output_size) {
+    if (!dlss_sr || !xfb_velocity || motion_debug) {
+        return {};
+    }
+    if (const auto outputs = xfb_velocity->FrameOutputs()) {
+        return dlss_sr->Render(color, view, format, *outputs, output_size);
+    }
+    return {};
 }
 
 void Rasterizer::OnSubmit() {

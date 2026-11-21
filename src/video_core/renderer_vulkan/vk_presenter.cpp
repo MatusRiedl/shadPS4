@@ -696,7 +696,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     };
 
     draw_scheduler.EndRendering();
-    const auto cmdbuf = draw_scheduler.CommandBuffer();
+    auto cmdbuf = draw_scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &pre_barrier,
@@ -740,6 +740,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
 
     rasterizer->EvaluateNr(image);
+    // Overtime Native v3: DLSS Super Resolution at the upscale slot; FSR 1 when it cannot run.
+    const vk::ImageView dlss_view = rasterizer->UpscaleDlss(image, image_view, view_info.format,
+                                                            {frame->width, frame->height});
+    // The host passes finish the command buffer when their targets are resized.
+    cmdbuf = draw_scheduler.CommandBuffer();
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
@@ -747,8 +752,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                     vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
 
-    image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
-                                 fsr_settings, frame->is_hdr);
+    if (dlss_view) {
+        image_view = dlss_view;
+        DebugState.is_using_fsr = false;
+    } else {
+        auto settings = fsr_settings;
+        settings.enable = settings.enable || HostPasses::Picture::DlssSr();
+        image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
+                                     settings, frame->is_hdr);
+    }
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.

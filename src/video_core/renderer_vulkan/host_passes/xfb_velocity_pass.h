@@ -42,6 +42,9 @@ public:
         vk::ImageView motion_view;
         vk::Image depth;
         vk::ImageView depth_view;
+        // Source of each pixel's vector (R8): 0 per-vertex, 0.25 camera, 0.5 untrusted, 1 none.
+        vk::Image mask;
+        vk::ImageView mask_view;
         vk::Extent2D size;
     };
     std::optional<Outputs> FrameOutputs() const;

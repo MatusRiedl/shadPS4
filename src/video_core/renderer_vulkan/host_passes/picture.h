@@ -38,6 +38,10 @@ inline bool DlssFg() {
 
 /// The transform-feedback capture, velocity, depth and camera passes run only for a feature that
 /// reads them, or for the motion vector debug view.
+inline bool MotionDebug() {
+    return EmulatorSettings.IsMotionDebug();
+}
+
 inline bool MotionInputs() {
     return DlssSr() || DlssNr() || DlssFg() || EmulatorSettings.IsMotionDebug();
 }

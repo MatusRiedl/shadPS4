@@ -324,8 +324,10 @@ bool Instance::CreateDevice() {
     // v2's with every option off.
     transform_feedback = HostPasses::Picture::MotionInputs() &&
                          add_extension(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
-    // Fixed at device creation, so requested only when the Neural Rendering model is installed.
-    if (HostPasses::Picture::DlssNr() && HostPasses::DlssNrPass::ModelPresent()) {
+    // NGX's extensions, fixed at device creation: requested only for DLSS Super Resolution, or for
+    // DLSS 5 when its model is installed (VK_NVX_binary_import brings CUDA into the process).
+    if (HostPasses::Picture::DlssSr() ||
+        (HostPasses::Picture::DlssNr() && HostPasses::DlssNrPass::ModelPresent())) {
         const bool binary_import = add_extension("VK_NVX_binary_import");
         const bool image_view_handle = add_extension("VK_NVX_image_view_handle");
         neural_rendering = binary_import && image_view_handle;

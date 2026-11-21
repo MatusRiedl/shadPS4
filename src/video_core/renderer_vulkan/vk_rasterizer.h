@@ -9,6 +9,8 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/host_passes/dlss_nr_pass.h"
+#include "video_core/renderer_vulkan/host_passes/dlss_sr_pass.h"
+#include "video_core/renderer_vulkan/host_passes/motion_debug_pass.h"
 #include "video_core/renderer_vulkan/host_passes/xfb_velocity_pass.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -94,6 +96,9 @@ public:
 
     /// Runs DLSS Neural Rendering over the presented image when the model is available.
     void EvaluateNr(VideoCore::Image& color);
+    /// DLSS Super Resolution of the presented image (Native v3), or a null view (FSR 1 then).
+    vk::ImageView UpscaleDlss(VideoCore::Image& color, vk::ImageView view, vk::Format format,
+                              vk::Extent2D output_size);
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
@@ -215,6 +220,8 @@ private:
     std::optional<VideoCore::XfbCapture> xfb_capture;
     std::optional<HostPasses::XfbVelocityPass> xfb_velocity;
     std::optional<HostPasses::DlssNrPass> dlss_nr;
+    std::optional<HostPasses::DlssSrPass> dlss_sr;
+    std::optional<HostPasses::MotionDebugPass> motion_debug;
     vk::Extent2D xfb_output_extent{};
 
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
