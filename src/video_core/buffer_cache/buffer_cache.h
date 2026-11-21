@@ -165,6 +165,7 @@ private:
         u64 wait_tick; ///< Tick of the last GPU write to the downloaded windows
         u32 windows;
         bool ahead;
+        bool open_write; ///< The calling thread found a GPU write in the open command buffer
     };
     struct ReadbackContext;
 

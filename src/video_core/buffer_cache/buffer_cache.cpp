@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <magic_enum/magic_enum.hpp>
@@ -32,6 +35,68 @@ namespace VideoCore {
 // Overtime switches, see common/overtime_switch.h.
 static const bool rb_guest = Overtime::SwitchOn("OVERTIME_RB_GUEST");
 static const bool stream_reuse = Overtime::SwitchOn("OVERTIME_STREAM_REUSE");
+static const bool rb_flush = Overtime::SwitchOn("OVERTIME_RB_FLUSH");
+
+// Overtime readback counters, off unless OVERTIME_RB_STATS is "1": every 5 s one log line counts
+// the readbacks by path and the time guest threads and the GPU thread spent in them.
+namespace {
+struct RbCounters {
+    std::atomic<u64> calls, writes, gpu_own, caller_ok, caller_none, caller_two_arenas, caller_open,
+        gpu_ahead, gpu_drain, gpu_async, bytes, windows, guest_wait_us, gpu_ahead_us, gpu_drain_us,
+        written_binds, written_bytes, written_big, flushes, flush_open_again;
+};
+RbCounters rb_counters{};
+const bool rb_stats = [] {
+    const char* v = std::getenv("OVERTIME_RB_STATS");
+    return v && v[0] == '1';
+}();
+std::atomic<u64> rb_last_log_us{0};
+
+u64 RbNowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void RbCount(std::atomic<u64>& counter, u64 value = 1) {
+    if (rb_stats) {
+        counter.fetch_add(value, std::memory_order_relaxed);
+    }
+}
+
+void RbMaybeLog() {
+    const u64 now = RbNowUs();
+    u64 last = rb_last_log_us.load(std::memory_order_relaxed);
+    if (last == 0) {
+        rb_last_log_us.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 5'000'000 || !rb_last_log_us.compare_exchange_strong(last, now)) {
+        return;
+    }
+    auto& c = rb_counters;
+    const auto take = [](std::atomic<u64>& v) { return v.exchange(0, std::memory_order_relaxed); };
+    const u64 calls = take(c.calls), writes = take(c.writes), gpu_own = take(c.gpu_own),
+              caller_ok = take(c.caller_ok), none = take(c.caller_none),
+              two_arenas = take(c.caller_two_arenas), open = take(c.caller_open),
+              ahead = take(c.gpu_ahead), drain = take(c.gpu_drain), async = take(c.gpu_async),
+              bytes = take(c.bytes), windows = take(c.windows), guest_us = take(c.guest_wait_us),
+              ahead_us = take(c.gpu_ahead_us), drain_us = take(c.gpu_drain_us),
+              marks = take(c.written_binds), marked = take(c.written_bytes),
+              big_marks = take(c.written_big), flushes = take(c.flushes),
+              open_again = take(c.flush_open_again);
+    // Warning level so the line shows with the usual log filter; it is only on when asked for.
+    LOG_WARNING(Render,
+                "Overtime readbacks in {} ms: {} ({} write faults, {} from the GPU thread); guest "
+                "thread {} + {} not GPU memory (fell back: {} open command buffer, {} two "
+                "arenas; flush-only {}, open again after it {}); GPU thread ahead {} ({} ms), "
+                "drain {} ({} ms), async {}; {} KB in {} windows; guest threads waited {} ms; "
+                "GPU-written binds {} ({} MB, {} over 1 MB)",
+                (now - last) / 1000, calls, writes, gpu_own, caller_ok, none, open, two_arenas,
+                flushes, open_again, ahead, ahead_us / 1000, drain, drain_us / 1000, async,
+                bytes / 1024, windows, guest_us / 1000, marks, marked >> 20, big_marks);
+}
+} // namespace
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
@@ -165,13 +230,40 @@ void BufferCache::WriteAndUnmarkGpuModified(VAddr device_addr, const u8* data, u
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool async,
                              bool assume_locks) {
     ReadbackStats stats{};
+    const u64 start_us = rb_stats ? RbNowUs() : 0;
+    RbCount(rb_counters.calls);
+    RbCount(rb_counters.writes, is_write ? 1 : 0);
     if (assume_locks) {
+        RbCount(rb_counters.gpu_own);
         ReadMemoryOnGpuThread(device_addr, size, is_write, async, stats);
     } else if (async || !rb_guest ||
                !ReadMemoryOnCallingThread(device_addr, size, is_write, stats)) {
-        liverpool->SendCommand<true>([this, device_addr, size, is_write, async, &stats] {
-            ReadMemoryOnGpuThread(device_addr, size, is_write, async, stats);
-        });
+        bool done = false;
+        if (rb_flush && stats.open_write) {
+            // Flush-only: the GPU thread just submits its open command buffer, and the copy then
+            // runs on this thread like any readback of submitted writes. The GPU thread goes on
+            // with the next commands instead of waiting for the whole GPU to finish.
+            liverpool->SendCommand<true>([this] { scheduler.Flush(); });
+            stats.open_write = false;
+            RbCount(rb_counters.flushes);
+            done = ReadMemoryOnCallingThread(device_addr, size, is_write, stats);
+            // A new GPU write to the window may have been recorded meanwhile; the GPU thread
+            // then reads it back as before.
+            RbCount(rb_counters.flush_open_again, stats.open_write ? 1 : 0);
+        }
+        if (!done) {
+            liverpool->SendCommand<true>([this, device_addr, size, is_write, async, &stats] {
+                ReadMemoryOnGpuThread(device_addr, size, is_write, async, stats);
+            });
+        }
+    }
+    if (rb_stats) {
+        RbCount(rb_counters.bytes, stats.bytes);
+        RbCount(rb_counters.windows, stats.windows);
+        if (!assume_locks) {
+            RbCount(rb_counters.guest_wait_us, RbNowUs() - start_us);
+        }
+        RbMaybeLog();
     }
 }
 
@@ -184,17 +276,21 @@ bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is
         const Buffer* arena = address_space[device_addr >> ARENA_PAGE_BITS];
         if (arena != address_space[(device_addr + size - 1) >> ARENA_PAGE_BITS]) {
             // The request spans two arenas, only the GPU thread can merge them.
+            RbCount(rb_counters.caller_two_arenas);
             return false;
         }
         if (!arena) {
             // The GPU never wrote this memory through the buffer cache.
             FinishReadback(lk, device_addr, size, is_write, stats);
+            RbCount(rb_counters.caller_none);
             return true;
         }
         window = GetDownloadWindow(arena, device_addr, size);
     } while (WaitDownloadsInFlight(lk, window.start, window.start + window.size, stats));
     if (!IsGpuWriteSubmitted(window.start, window.size)) {
         // A GPU write to the window is still in the open command buffer.
+        RbCount(rb_counters.caller_open);
+        stats.open_write = true;
         return false;
     }
     hot_windows[window.start] = {window.size, scheduler.CurrentTick()};
@@ -203,6 +299,7 @@ bool BufferCache::ReadMemoryOnCallingThread(VAddr device_addr, u64 size, bool is
     stats.ahead = true;
     DownloadAhead(lk, windows, stats);
     FinishReadback(lk, device_addr, size, is_write, stats);
+    RbCount(rb_counters.caller_ok);
     return true;
 }
 
@@ -222,13 +319,20 @@ void BufferCache::ReadMemoryOnGpuThread(VAddr device_addr, u64 size, bool is_wri
     if (!async) {
         hot_windows[window.start] = {window.size, scheduler.CurrentTick()};
     }
+    const u64 start_us = rb_stats ? RbNowUs() : 0;
     if (ahead) {
         boost::container::small_vector<DownloadWindow, 16> windows{window};
         AddHotWindows(windows);
         stats.ahead = true;
         DownloadAhead(lk, windows, stats);
+        RbCount(rb_counters.gpu_ahead);
+        RbCount(rb_counters.gpu_ahead_us, rb_stats ? RbNowUs() - start_us : 0);
     } else {
         DownloadMemory(lk, arena, window.start, window.size, async, stats);
+        RbCount(async ? rb_counters.gpu_async : rb_counters.gpu_drain);
+        if (!async) {
+            RbCount(rb_counters.gpu_drain_us, rb_stats ? RbNowUs() - start_us : 0);
+        }
     }
     FinishReadback(lk, device_addr, size, is_write, stats);
 }
@@ -907,6 +1011,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             total_size_bytes += size;
         });
         if (is_written) {
+            RbCount(rb_counters.written_binds);
+            RbCount(rb_counters.written_bytes, size);
+            RbCount(rb_counters.written_big, size > 1_MB ? 1 : 0);
             gpu_modified_ranges.Add(device_addr, size);
             const u64 tick = scheduler.CurrentTick();
             for (u64 chunk = device_addr >> WriteTickChunkBits;

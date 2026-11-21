@@ -161,9 +161,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         liverpool->BindRasterizer(this);
     }
     LOG_INFO(Core,
-             "Overtime Native v2 switches: RB_GUEST={} (readback queue: {}) LOOKUP_MEMO={} "
-             "STREAM_REUSE={} THREAD_PRIORITY={} ASYNC_PIPELINES={} VK_RECORDER={}",
-             Overtime::SwitchOn("OVERTIME_RB_GUEST"), instance.HasReadbackQueue(), lookup_memo,
+             "Overtime Native v2 switches: RB_GUEST={} (readback queue: {}) RB_FLUSH={} "
+             "LOOKUP_MEMO={} STREAM_REUSE={} THREAD_PRIORITY={} ASYNC_PIPELINES={} VK_RECORDER={}",
+             Overtime::SwitchOn("OVERTIME_RB_GUEST"), instance.HasReadbackQueue(),
+             Overtime::SwitchOn("OVERTIME_RB_FLUSH"), lookup_memo,
              Overtime::SwitchOn("OVERTIME_STREAM_REUSE"),
              Overtime::SwitchOn("OVERTIME_THREAD_PRIORITY"),
              Overtime::SwitchOn("OVERTIME_ASYNC_PIPELINES"),

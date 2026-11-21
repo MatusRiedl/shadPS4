@@ -15,6 +15,10 @@
 //   OVERTIME_RB_GUEST     a readback whose GPU writes were all submitted copies on a second queue,
 //                         waiting only for the last write (on the faulting guest thread when it
 //                         can), instead of the GPU thread draining the whole GPU (Kravickas)
+//   OVERTIME_RB_FLUSH     a readback whose GPU write is still in the open command buffer has the
+//                         GPU thread only submit that buffer and copies on the faulting guest
+//                         thread, instead of the GPU thread draining the whole GPU (with RB_GUEST)
+//   OVERTIME_RB_STATS     diagnostic, off unless "1": a log line every 5 s counts readbacks by path
 //   OVERTIME_LOOKUP_MEMO  draws reuse the last render target, depth and texture lookup when the
 //                         registers / T# and the texture cache registry are unchanged (Kravickas)
 //   OVERTIME_STREAM_REUSE a read-only binding equal to an earlier copy of the same range in the
