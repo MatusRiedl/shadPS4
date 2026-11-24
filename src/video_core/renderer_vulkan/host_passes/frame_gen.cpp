@@ -207,7 +207,9 @@ struct State {
     FrameLedger ledger;
     ModeGate gate;
     ModeSequencer sequencer;
-    u64 started = 0; // index the flip-submit side started (simulation start marker)
+    u64 submitted = 0; // the last guest flip's frame number (simulation markers)
+    u64 executing = 0; // the frame the GPU thread prepares (FlipExecuting)
+    u32 status_dumps = 0;
     sl::FrameToken* present_token = nullptr;
     u32 frames_max = 0;
     u32 min_size = 0;
@@ -216,7 +218,8 @@ struct State {
     u64 tagged = 0;
     u64 presents = 0;
     u64 new_frame_presents = 0;
-    u64 multi_presents = 0; // presents where Streamline showed more than one frame
+    u64 multi_presents = 0;  // presents where Streamline showed more than one frame
+    u64 skipped_repeats = 0; // repeated frames not presented while the mode was on
 };
 
 State& G() {
@@ -418,10 +421,10 @@ Projection FixedProjection(vk::Extent2D size) {
 void LogExit() {
     auto& g = G();
     LOG_INFO(Render_Vulkan,
-             "OVERTIME_FG: exit presents={} new_frames={} tagged={} multi={} api_errors={} "
-             "gate={} failed={}",
-             g.presents, g.new_frame_presents, g.tagged, g.multi_presents, g.api_errors.load(),
-             g.gate.On() ? 1 : 0, g.gate.Failed() ? 1 : 0);
+             "OVERTIME_FG: exit presents={} new_frames={} tagged={} multi={} skipped={} "
+             "api_errors={} gate={} failed={}",
+             g.presents, g.new_frame_presents, g.tagged, g.multi_presents, g.skipped_repeats,
+             g.api_errors.load(), g.gate.On() ? 1 : 0, g.gate.Failed() ? 1 : 0);
 }
 
 } // namespace
@@ -612,6 +615,7 @@ bool BeforePresent(u32 width, u32 height, u64 index) {
     }
     std::scoped_lock lock{g.mutex};
     const bool new_frame = index != 0;
+    const bool tagged = g.ledger.WasTagged(index); // frame generation runs on tagged frames only
     g.presents++;
     if (new_frame) {
         g.new_frame_presents++;
@@ -631,6 +635,14 @@ bool BeforePresent(u32 width, u32 height, u64 index) {
         // presents of grace after turning on, while Streamline sees the first markers.
         if (g.sequencer.Current() == ModeSequencer::State::On &&
             state.status != sl::DLSSGStatus::eOk) {
+            if (g.bad_status == 0 && g.status_dumps < 3) {
+                g.status_dumps++;
+                LOG_INFO(Render_Vulkan,
+                         "OVERTIME_FG: status={:#x} at present frame={} tagged={} submitted={} "
+                         "executing={} last_tagged={}",
+                         static_cast<u32>(state.status), index, tagged ? 1 : 0, g.submitted,
+                         g.executing, g.ledger.LastTagged());
+            }
             if (++g.bad_status >= 10) {
                 const char* reason = StatusName(state.status);
                 g.gate.Fail(reason);
@@ -643,7 +655,7 @@ bool BeforePresent(u32 width, u32 height, u64 index) {
         }
     }
     const bool window_ok = width != 0 && height != 0 && std::min(width, height) >= g.min_size;
-    const auto step = g.gate.Update({new_frame, window_ok});
+    const auto step = g.gate.Update({tagged, window_ok});
     const auto out = g.sequencer.BeforePresent(step.on);
     if (out.set_options) {
         SetModeLocked(out.options_on);
@@ -655,14 +667,27 @@ bool BeforePresent(u32 width, u32 height, u64 index) {
     g.present_token = new_frame ? TokenLocked(index) : nullptr;
     if (g.presents % 600 == 0) {
         LOG_INFO(Render_Vulkan,
-                 "OVERTIME_FG: stats presents={} new_frames={} tagged={} multi={} state={} "
-                 "gate={} status={:#x} min={} max={} api_errors={}",
-                 g.presents, g.new_frame_presents, g.tagged, g.multi_presents,
+                 "OVERTIME_FG: stats presents={} new_frames={} tagged={} multi={} skipped={} "
+                 "state={} gate={} status={:#x} min={} max={} api_errors={}",
+                 g.presents, g.new_frame_presents, g.tagged, g.multi_presents, g.skipped_repeats,
                  static_cast<int>(g.sequencer.Current()), g.gate.On() ? 1 : 0,
                  static_cast<u32>(state.status), g.min_size, g.frames_max,
                  g.api_errors.load(std::memory_order_relaxed));
     }
     return out.request_recreate;
+}
+
+bool SkipRepeat() {
+    auto& g = G();
+    if (!g.ready.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    std::scoped_lock lock{g.mutex};
+    if (g.sequencer.Current() != ModeSequencer::State::On) {
+        return false;
+    }
+    g.skipped_repeats++;
+    return true;
 }
 
 bool AfterFrameGenRecreate() {
@@ -718,20 +743,20 @@ void PresentEnd() {
     Marker(sl::PCLMarker::ePresentEnd, token);
 }
 
-void FlipSubmitted(bool guest_thread) {
+u64 FlipSubmitted(bool guest_thread) {
     auto& g = G();
     if (!g.ready.load(std::memory_order_relaxed)) {
-        return;
+        return 0;
     }
     sl::FrameToken* ending = nullptr;
     sl::FrameToken* next = nullptr;
+    u64 frame = 0;
     {
+        // This flip ends frame `frame` (simulated since the last flip) and starts the next one.
         std::scoped_lock lock{g.mutex};
-        if (g.started != 0) {
-            ending = TokenLocked(g.started);
-        }
-        g.started = std::max(g.started + 1, g.ledger.LastTagged() + 1);
-        next = TokenLocked(g.started);
+        frame = ++g.submitted;
+        ending = TokenLocked(frame);
+        next = TokenLocked(frame + 1);
     }
     Marker(sl::PCLMarker::eSimulationEnd, ending);
     Marker(sl::PCLMarker::eRenderSubmitStart, ending);
@@ -741,23 +766,45 @@ void FlipSubmitted(bool guest_thread) {
         g.api.reflex_sleep(*next);
     }
     Marker(sl::PCLMarker::eSimulationStart, next);
+    return frame;
+}
+
+void FlipExecuting(u64 frame) {
+    auto& g = G();
+    if (!g.ready.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::scoped_lock lock{g.mutex};
+    g.executing = frame;
+}
+
+u64 FrameIndex() {
+    auto& g = G();
+    if (!g.ready.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    std::scoped_lock lock{g.mutex};
+    return g.executing;
 }
 
 u64 TagFrame(vk::CommandBuffer cmdbuf, const TagInputs& inputs) {
     auto& g = G();
-    if (!g.ready.load(std::memory_order_relaxed) || g.tags_off.load(std::memory_order_relaxed) ||
-        !cmdbuf || !inputs.depth || !inputs.motion || !inputs.depth_view || !inputs.motion_view ||
-        inputs.size.width == 0 || inputs.size.height == 0) {
+    if (!g.ready.load(std::memory_order_relaxed)) {
         return 0;
     }
     std::scoped_lock lock{g.mutex};
-    const u64 index = g.ledger.Tag(g.started);
+    const u64 index = g.executing;
+    if (index == 0 || g.tags_off.load(std::memory_order_relaxed) || !cmdbuf || !inputs.depth ||
+        !inputs.motion || !inputs.depth_view || !inputs.motion_view || inputs.size.width == 0 ||
+        inputs.size.height == 0) {
+        return index;
+    }
     sl::FrameToken* const token = TokenLocked(index);
     if (token == nullptr) {
         g.tags_off.store(true);
         g.pending_fail.store("tag-token");
         LOG_WARNING(Render_Vulkan, "OVERTIME_FG: tag failed index={}: frame token", index);
-        return 0;
+        return index;
     }
 
     // Constants: matrices without jitter (the velocity pass has none), motion in pixels from
@@ -815,8 +862,9 @@ u64 TagFrame(vk::CommandBuffer cmdbuf, const TagInputs& inputs) {
                     "OVERTIME_FG: tag failed index={} constants={} tags={}: no more tags this "
                     "session",
                     index, ResultName(constants_result), ResultName(tag_result));
-        return 0;
+        return index;
     }
+    g.ledger.Tagged(index);
     g.last_size = inputs.size;
     if (++g.tagged <= 3) {
         LOG_INFO(Render_Vulkan, "OVERTIME_FG: tag index={} size={}x{} lifetime={} reset={}", index,

@@ -362,7 +362,7 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
         ++port->flip_status.gc_queue_num;
     }
     // DLSS frame generation: the guest's frame ends here (simulation markers, Reflex's sleep).
-    Vulkan::HostPasses::FrameGen::FlipSubmitted(true);
+    const u64 fg_frame = Vulkan::HostPasses::FrameGen::FlipSubmitted(true);
 
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
@@ -377,7 +377,7 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
                 LOG_WARNING(Lib_VideoOut, "Out of order flip IRQ (buffer {}, label {}), flipping",
                             buf_id, port->buffer_labels[buf_id]);
             }
-            const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true);
+            const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true, fg_frame);
             ASSERT_MSG(result, "EOP flip submission failed");
         });
 

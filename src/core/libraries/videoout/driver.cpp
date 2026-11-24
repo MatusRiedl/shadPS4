@@ -292,6 +292,9 @@ void VideoOutDriver::DrawBlankFrame() {
 }
 
 void VideoOutDriver::DrawLastFrame() {
+    if (Vulkan::HostPasses::FrameGen::SkipRepeat()) {
+        return;
+    }
     const auto frame = presenter->PrepareLastFrame();
     if (frame != nullptr) {
         presenter->Present(frame, true);
@@ -299,7 +302,7 @@ void VideoOutDriver::DrawLastFrame() {
 }
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
-                                bool is_eop /*= false*/) {
+                                bool is_eop /*= false*/, u64 fg_frame /*= 0*/) {
     {
         std::unique_lock lock{port->port_mutex};
         // An EOP flip was admitted and counted when it was submitted.
@@ -320,17 +323,21 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
     if (!is_eop) {
         // DLSS frame generation: the guest's frame ends here (an EOP flip ends it at submission).
-        Vulkan::HostPasses::FrameGen::FlipSubmitted(true);
+        const u64 frame = Vulkan::HostPasses::FrameGen::FlipSubmitted(true);
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        liverpool->SendCommand(
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, frame); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, fg_frame);
     }
 
     return true;
 }
 
-void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                                        u64 fg_frame) {
+    // DLSS frame generation: the frame prepared now is this flip's (its tags and present).
+    Vulkan::HostPasses::FrameGen::FlipExecuting(fg_frame);
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);

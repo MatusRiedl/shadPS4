@@ -140,22 +140,26 @@ private:
     std::string_view m_fail_reason;
 };
 
-// Which frame index a tag gets. Streamline links the tags and constants of a frame to its present
-// through the frame token; the index rides with the presenter's Frame from PrepareFrame to Present.
-// Indices only grow and stay at or after the frame the flip-submit side started (the simulation
-// markers' index). Callers hold one mutex around these calls.
+// Which frames carry tags. A frame is numbered by its guest flip (1, 2, ...); the number rides with
+// the flip to the GPU thread and with the presenter's Frame to its present, so Streamline sees the
+// simulation markers, tags, constants and present of one frame under one frame token, also while
+// the guest runs frames ahead of the GPU. Callers hold one mutex around these calls.
 class FrameLedger {
 public:
-    // started: the frame the flip-submit side last started (0 = none yet).
-    uint64_t Tag(uint64_t started) {
-        m_last_tagged = std::max(started, m_last_tagged + 1);
-        return m_last_tagged;
+    void Tagged(uint64_t frame) {
+        m_ring[frame % m_ring.size()] = frame;
+        m_last_tagged = std::max(m_last_tagged, frame);
+    }
+    // True when `frame` (not 0) was tagged among the last 64 frames.
+    [[nodiscard]] bool WasTagged(uint64_t frame) const {
+        return frame != 0 && m_ring[frame % m_ring.size()] == frame;
     }
     [[nodiscard]] uint64_t LastTagged() const {
         return m_last_tagged;
     }
 
 private:
+    std::array<uint64_t, 64> m_ring{};
     uint64_t m_last_tagged = 0;
 };
 

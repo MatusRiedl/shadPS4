@@ -693,12 +693,13 @@ void Rasterizer::EvaluateNr(VideoCore::Image& color) {
 }
 
 u64 Rasterizer::TagFrameGen() {
-    if (!xfb_velocity || !HostPasses::FrameGen::Ready()) {
+    if (!HostPasses::FrameGen::Ready()) {
         return 0;
     }
-    const auto outputs = xfb_velocity->FrameOutputs();
+    // A frame without depth and motion is not tagged, but its present still needs its number.
+    const auto outputs = xfb_velocity ? xfb_velocity->FrameOutputs() : std::nullopt;
     if (!outputs) {
-        return 0;
+        return HostPasses::FrameGen::FrameIndex();
     }
     scheduler.EndRendering();
     const vk::CommandBuffer cmdbuf = scheduler.CommandBuffer();

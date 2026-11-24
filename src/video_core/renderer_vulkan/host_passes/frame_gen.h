@@ -41,11 +41,16 @@ bool Ready();
 vk::PresentModeKHR AdjustPresentMode(vk::PresentModeKHR requested, bool mailbox_available,
                                      bool immediate_available);
 
-/// Present thread, before acquiring. index: the frame index TagFrame gave the frame about to be
-/// shown, 0 for a repeat or blank frame. Returns true when the swapchain must be recreated first
-/// (RecreateForFrameGen, then AfterFrameGenRecreate until it returns false).
+/// Present thread, before acquiring. index: the number of the frame about to be shown (its flip's,
+/// from FlipSubmitted), 0 for a repeat or blank frame. Returns true when the swapchain must be
+/// recreated first (RecreateForFrameGen, then AfterFrameGenRecreate until it returns false).
 bool BeforePresent(u32 width, u32 height, u64 index);
 bool AfterFrameGenRecreate();
+
+/// Present thread, before showing the last frame again: true while frame generation is on, and it
+/// is not shown again. Every present must carry its frame's Reflex markers (DLSS-G turns itself
+/// off otherwise); the generated frames fill the gap.
+bool SkipRepeat();
 
 /// Before any other swapchain recreate (resize, out of date, HDR): frame generation off first.
 void BeforeOutsideRecreate();
@@ -55,11 +60,21 @@ void PresentStart();
 void PresentEnd();
 
 /// A guest flip was submitted: the simulation markers, and Reflex's sleep while frame generation
-/// is on (on the guest's thread, by default).
-void FlipSubmitted(bool guest_thread);
+/// is on (on the guest's thread, by default). Returns the flip's frame number (0 before Streamline
+/// is set up), which rides with the flip to FlipExecuting.
+u64 FlipSubmitted(bool guest_thread);
+
+/// GPU thread, before the flip's frame is prepared: `frame` is FlipSubmitted's number for it. The
+/// guest may run frames ahead of the GPU; its tags and its present use this number, so every call
+/// for one frame carries the same frame token.
+void FlipExecuting(u64 frame);
+
+/// The frame the GPU thread prepares now (FlipExecuting's), 0 before Streamline is set up. A frame
+/// without tags still carries it to its present (the present markers).
+u64 FrameIndex();
 
 /// GPU thread, after the frame's host passes: tags depth and motion vectors with the constants.
-/// Returns the frame index for Present, 0 when nothing was tagged.
+/// Returns the frame's number for its present (also when the tags failed), 0 before set up.
 u64 TagFrame(vk::CommandBuffer cmdbuf, const TagInputs& inputs);
 
 #else
@@ -80,10 +95,19 @@ inline bool BeforePresent(u32, u32, u64) {
 inline bool AfterFrameGenRecreate() {
     return false;
 }
+inline bool SkipRepeat() {
+    return false;
+}
 inline void BeforeOutsideRecreate() {}
 inline void PresentStart() {}
 inline void PresentEnd() {}
-inline void FlipSubmitted(bool) {}
+inline u64 FlipSubmitted(bool) {
+    return 0;
+}
+inline void FlipExecuting(u64) {}
+inline u64 FrameIndex() {
+    return 0;
+}
 inline u64 TagFrame(vk::CommandBuffer, const TagInputs&) {
     return 0;
 }

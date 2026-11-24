@@ -4,8 +4,10 @@
 #include "common/process_exit.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 
 #include "common/logging/log.h"
 
@@ -28,6 +30,9 @@ void Terminator() {
     }
     if (auto* before = g_before.exchange(nullptr)) {
         before();
+        // The log writes through an async sink: give its thread a moment to take the lines
+        // logged just now before the process ends.
+        std::this_thread::sleep_for(std::chrono::milliseconds{150});
     }
     Log::Flush();
     std::fflush(stdout);
