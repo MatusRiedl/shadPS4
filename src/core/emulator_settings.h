@@ -437,10 +437,12 @@ struct GPUSettings {
     Setting<u32> submit_draw_interval{0};
     // Overtime Native v3 picture options: each off by default, each changes only the picture.
     // upscaler: "" follows fsr_enabled; "off" | "fsr1" | "dlss". frame_gen: "off" | "dlss".
+    // frame_gen_frames: generated frames per rendered frame, 1..3 (2x..4x), clamped to the card.
     Setting<std::string> upscaler{""};
     Setting<bool> dlss_nr{false};
     Setting<std::string> dlss_nr_dll{""};
     Setting<std::string> frame_gen{"off"};
+    Setting<u32> frame_gen_frames{1};
     Setting<bool> motion_debug{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -472,6 +474,7 @@ struct GPUSettings {
             make_override<GPUSettings>("dlss_nr", &GPUSettings::dlss_nr),
             make_override<GPUSettings>("dlss_nr_dll", &GPUSettings::dlss_nr_dll),
             make_override<GPUSettings>("frame_gen", &GPUSettings::frame_gen),
+            make_override<GPUSettings>("frame_gen_frames", &GPUSettings::frame_gen_frames),
             make_override<GPUSettings>("motion_debug", &GPUSettings::motion_debug),
         };
     }
@@ -484,7 +487,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
                                    userfaultfd, inline_fetch_shader, fast_shader_math,
                                    submit_draw_interval, upscaler, dlss_nr, dlss_nr_dll, frame_gen,
-                                   motion_debug)
+                                   frame_gen_frames, motion_debug)
 
 // -------------------------------
 // Vulkan settings
@@ -797,6 +800,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DlssNr, dlss_nr)
     SETTING_FORWARD(m_gpu, DlssNrDll, dlss_nr_dll)
     SETTING_FORWARD(m_gpu, FrameGen, frame_gen)
+    SETTING_FORWARD(m_gpu, FrameGenFrames, frame_gen_frames)
     SETTING_FORWARD_BOOL(m_gpu, MotionDebug, motion_debug)
 
     u32 GetVblankFrequency() {

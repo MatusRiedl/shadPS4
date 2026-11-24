@@ -810,6 +810,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/arch.h
            src/common/assert.cpp
            src/common/assert.h
+           src/common/process_exit.cpp
+           src/common/process_exit.h
            src/common/bit_field.h
            src/common/bounded_threadsafe_queue.h
            src/common/concepts.h
@@ -1237,6 +1239,9 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/host_passes/dlss_nr_pass.h
                src/video_core/renderer_vulkan/host_passes/dlss_sr_pass.cpp
                src/video_core/renderer_vulkan/host_passes/dlss_sr_pass.h
+               src/video_core/renderer_vulkan/host_passes/frame_gen.cpp
+               src/video_core/renderer_vulkan/host_passes/frame_gen.h
+               src/video_core/renderer_vulkan/host_passes/frame_gen_policy.h
                src/video_core/renderer_vulkan/host_passes/motion_debug_pass.cpp
                src/video_core/renderer_vulkan/host_passes/motion_debug_pass.h
                src/video_core/renderer_vulkan/host_passes/ngx_abi.h
@@ -1373,6 +1378,15 @@ if (WIN32 AND MSVC)
                 src/video_core/renderer_vulkan/host_passes/dlss_nr_forwarder.cpp)
     set_target_properties(dlssnr_forwarder PROPERTIES OUTPUT_NAME "nvngx.dll_dlssnr")
     add_dependencies(shadps4 dlssnr_forwarder)
+endif()
+
+# Overtime Native v3: DLSS frame generation through NVIDIA Streamline (GPU.frame_gen = "dlss",
+# experimental). Headers only (externals/streamline, MIT): sl.interposer.dll is loaded with
+# LoadLibrary from beside the exe, so a missing DLL cannot stop the program. Nothing NVIDIA is linked.
+option(OVERTIME_ENABLE_DLSSG "Build DLSS frame generation through Streamline (Windows)" ON)
+if (WIN32 AND MSVC AND OVERTIME_ENABLE_DLSSG)
+    target_include_directories(shadps4 SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/externals/streamline/include)
+    target_compile_definitions(shadps4 PRIVATE OVERTIME_ENABLE_DLSSG=1)
 endif()
 
 create_target_directory_groups(shadps4)

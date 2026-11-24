@@ -26,6 +26,7 @@
 #include "common/ntapi.h"
 #include "common/path_util.h"
 #include "common/polyfill_thread.h"
+#include "common/process_exit.h"
 #include "common/scm_rev.h"
 #include "common/singleton.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
@@ -832,7 +833,7 @@ void Emulator::Restart(std::filesystem::path eboot_path,
 
     if (!success) {
         std::cerr << "Failed to restart game: {}" << GetLastError() << std::endl;
-        std::quick_exit(1);
+        Common::QuickExit(1);
     }
 
     CloseHandle(pi.hProcess);

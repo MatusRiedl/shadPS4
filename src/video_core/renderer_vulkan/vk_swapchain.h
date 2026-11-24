@@ -28,6 +28,9 @@ public:
     /// Recreates the swapchain with a given size and current surface.
     void Recreate(u32 width, u32 height);
 
+    /// Recreates the swapchain at its size to turn DLSS frame generation on or off.
+    void RecreateForFrameGen();
+
     /// Acquires the next image in the swapchain.
     bool AcquireNextImage();
 
@@ -119,6 +122,8 @@ private:
     vk::SurfaceFormatKHR surface_format;
     vk::Format view_format;
     vk::PresentModeKHR present_mode;
+    bool mailbox_available{};
+    bool immediate_available{};
     vk::Extent2D extent;
     vk::SurfaceTransformFlagBitsKHR transform;
     vk::CompositeAlphaFlagBitsKHR composite_alpha;

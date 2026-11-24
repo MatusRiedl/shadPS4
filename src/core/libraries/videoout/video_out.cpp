@@ -13,6 +13,7 @@
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
+#include "video_core/renderer_vulkan/host_passes/frame_gen.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -360,6 +361,8 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
         ++port->flip_status.flip_pending_num;
         ++port->flip_status.gc_queue_num;
     }
+    // DLSS frame generation: the guest's frame ends here (simulation markers, Reflex's sleep).
+    Vulkan::HostPasses::FrameGen::FlipSubmitted(true);
 
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {

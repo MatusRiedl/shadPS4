@@ -180,7 +180,7 @@ struct AddressSpace::Impl {
         // the guest has reserved all free space below 1 TB. Leave it a hole the guest does not use
         // (NHL 19 maps at 0x7000000000 and 0xfbffffc000, both outside), so guest addresses stay as
         // with DLSS off. The memory manager builds its map from these regions and skips the hole.
-        if (Vulkan::HostPasses::Picture::NgxExtensions()) {
+        if (Vulkan::HostPasses::Picture::CudaWindow()) {
             constexpr VAddr hole_lo = Vulkan::HostPasses::Picture::CudaWindowBase;
             constexpr VAddr hole_hi = Vulkan::HostPasses::Picture::CudaWindowEnd;
             std::map<VAddr, MemoryRegion> kept;

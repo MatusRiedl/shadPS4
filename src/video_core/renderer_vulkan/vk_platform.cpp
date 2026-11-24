@@ -21,6 +21,7 @@
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/host_passes/frame_gen.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #ifdef __APPLE__
@@ -271,8 +272,13 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 #endif
 
     static vk::detail::DynamicLoader dl;
-    VULKAN_HPP_DEFAULT_DISPATCHER.init(
-        dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+    auto get_instance_proc = dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+    // Overtime Native v3: with DLSS frame generation, Streamline's interposer is the loader of the
+    // windowed instance (it must see every Vulkan call from the instance on).
+    if (window_type != Frontend::WindowSystemType::Headless) {
+        get_instance_proc = HostPasses::FrameGen::LoaderBeforeInstance(get_instance_proc);
+    }
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc);
 
     const auto [available_version_result, available_version] =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion

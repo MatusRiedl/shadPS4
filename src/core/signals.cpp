@@ -5,6 +5,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/process_exit.h"
 #include "common/signal_context.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/libraries/kernel/kernel.h"
@@ -351,7 +352,7 @@ void SignalDispatch::RemoveHandlers() {
 #if defined(_WIN32)
     if (!(RemoveVectoredExceptionHandler(handle))) {
         LOG_CRITICAL(Core, "Failed to remove exception handler.");
-        std::quick_exit(1);
+        Common::QuickExit(1);
     }
 #else
     struct sigaction action{};

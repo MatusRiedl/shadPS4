@@ -50,6 +50,16 @@ inline bool MotionInputs() {
 /// Resolution, or for DLSS 5 when its model is installed. Fixed before the guest address space.
 bool NgxExtensions();
 
+/// The guest leaves the CUDA window free: for NGX's extensions, and for DLSS frame generation
+/// (Streamline adds the same extensions to the device itself).
+inline bool CudaWindow() {
+#if OVERTIME_ENABLE_DLSSG
+    return NgxExtensions() || DlssFg();
+#else
+    return NgxExtensions();
+#endif
+}
+
 /// With NGX's extensions the guest leaves this range free, so CUDA has room below 1 TB (it faults
 /// in vkCreateDevice when the guest has reserved all of that).
 constexpr unsigned long long CudaWindowBase = 0x8000000000ULL;

@@ -21,6 +21,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/host_passes/frame_gen.h"
 #include "video_core/renderer_vulkan/host_passes/picture.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
@@ -743,6 +744,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // Overtime Native v3: DLSS Super Resolution at the upscale slot; FSR 1 when it cannot run.
     const vk::ImageView dlss_view = rasterizer->UpscaleDlss(image, image_view, view_info.format,
                                                             {frame->width, frame->height});
+    // DLSS frame generation: this frame's depth and motion vectors, tagged for its present.
+    frame->fg_index = rasterizer->TagFrameGen();
     // The host passes finish the command buffer when their targets are resized.
     cmdbuf = draw_scheduler.CommandBuffer();
 
@@ -873,6 +876,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             free_cv.notify_one();
         }
     };
+
+    // DLSS frame generation turns on and off with a swapchain recreate in its present mode. A
+    // repeated or blank frame carries no new frame.
+    const u64 fg_index = is_reusing_frame ? 0 : frame->fg_index;
+    if (HostPasses::FrameGen::BeforePresent(swapchain.GetWidth(), swapchain.GetHeight(),
+                                            fg_index)) {
+        do {
+            swapchain.RecreateForFrameGen();
+        } while (HostPasses::FrameGen::AfterFrameGenRecreate());
+    }
 
     // Recreate the swapchain if the window was resized.
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
@@ -1099,7 +1112,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Present to swapchain.
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        HostPasses::FrameGen::PresentStart();
+        const bool presented = swapchain.Present();
+        HostPasses::FrameGen::PresentEnd();
+        if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
@@ -1146,6 +1162,7 @@ Frame* Presenter::GetRenderFrame() {
         RecreateFrame(frame, expected_frame_width, expected_frame_height);
     }
 
+    frame->fg_index = 0;
     return frame;
 }
 

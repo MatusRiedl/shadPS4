@@ -13,6 +13,7 @@
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/host_passes/dlss_nr_pass.h"
+#include "video_core/renderer_vulkan/host_passes/frame_gen.h"
 #include "video_core/renderer_vulkan/host_passes/picture.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -644,6 +645,7 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+    HostPasses::FrameGen::AfterDevice(*instance, physical_device, *device);
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);

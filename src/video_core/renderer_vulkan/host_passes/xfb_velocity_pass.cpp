@@ -21,6 +21,7 @@
 #include "video_core/host_shaders/xfb_velocity_frag.h"
 #include "video_core/host_shaders/xfb_velocity_resolve_comp.h"
 #include "video_core/host_shaders/xfb_velocity_vert.h"
+#include "video_core/renderer_vulkan/host_passes/picture.h"
 #include "video_core/renderer_vulkan/host_passes/xfb_velocity_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -663,7 +664,10 @@ void XfbVelocityPass::ResizeTargets(u32 width, u32 height, vk::SampleCountFlagBi
     SetObjectName(device, *mask_view, "XFB Velocity Mask View");
 
     image_ci.format = vk::Format::eR32Sfloat;
-    image_ci.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+    // Transfer source for DLSS frame generation, which copies it at tag time.
+    image_ci.usage =
+        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+        (Picture::DlssFg() ? vk::ImageUsageFlagBits::eTransferSrc : vk::ImageUsageFlags{});
     depth_out.Create(image_ci);
     SetObjectName(device, static_cast<vk::Image>(depth_out), "XFB Velocity Depth");
     view_ci.image = depth_out;

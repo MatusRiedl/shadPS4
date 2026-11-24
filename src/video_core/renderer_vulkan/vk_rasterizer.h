@@ -96,6 +96,9 @@ public:
 
     /// Runs DLSS Neural Rendering over the presented image when the model is available.
     void EvaluateNr(VideoCore::Image& color);
+    /// DLSS frame generation: tags this frame's depth and motion vectors. Returns the frame index
+    /// for the present, 0 when nothing was tagged.
+    u64 TagFrameGen();
     /// DLSS Super Resolution of the presented image (Native v3), or a null view (FSR 1 then).
     vk::ImageView UpscaleDlss(VideoCore::Image& color, vk::ImageView view, vk::Format format,
                               vk::Extent2D output_size);

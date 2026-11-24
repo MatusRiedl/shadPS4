@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include "common/debug.h"
 #include "common/logging/log.h"
@@ -13,6 +14,7 @@
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
 #include "shader_recompiler/xfb_layout.h"
+#include "video_core/renderer_vulkan/host_passes/frame_gen.h"
 #include "video_core/renderer_vulkan/host_passes/picture.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -688,6 +690,65 @@ void Rasterizer::EvaluateNr(VideoCore::Image& color) {
     if (const auto outputs = xfb_velocity->FrameOutputs()) {
         dlss_nr->Render(color, *outputs);
     }
+}
+
+u64 Rasterizer::TagFrameGen() {
+    if (!xfb_velocity || !HostPasses::FrameGen::Ready()) {
+        return 0;
+    }
+    const auto outputs = xfb_velocity->FrameOutputs();
+    if (!outputs) {
+        return 0;
+    }
+    scheduler.EndRendering();
+    const vk::CommandBuffer cmdbuf = scheduler.CommandBuffer();
+    // Streamline copies both images at tag time (eOnlyValidNow): after every write to them.
+    const vk::ImageSubresourceRange range{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .levelCount = 1,
+        .layerCount = 1,
+    };
+    const auto all = vk::PipelineStageFlagBits2::eAllCommands;
+    const auto any_access = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+    const std::array barriers = {
+        vk::ImageMemoryBarrier2{
+            .srcStageMask = all,
+            .srcAccessMask = any_access,
+            .dstStageMask = all,
+            .dstAccessMask = any_access,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = outputs->depth,
+            .subresourceRange = range,
+        },
+        vk::ImageMemoryBarrier2{
+            .srcStageMask = all,
+            .srcAccessMask = any_access,
+            .dstStageMask = all,
+            .dstAccessMask = any_access,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = outputs->motion,
+            .subresourceRange = range,
+        },
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+        .pImageMemoryBarriers = barriers.data(),
+    });
+    return HostPasses::FrameGen::TagFrame(
+        cmdbuf,
+        {
+            .depth = outputs->depth,
+            .depth_view = outputs->depth_view,
+            .depth_usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+                           vk::ImageUsageFlagBits::eTransferSrc,
+            .motion = outputs->motion,
+            .motion_view = outputs->motion_view,
+            .motion_usage = vk::ImageUsageFlagBits::eColorAttachment |
+                            vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc,
+            .size = outputs->size,
+        });
 }
 
 vk::ImageView Rasterizer::UpscaleDlss(VideoCore::Image& color, vk::ImageView view,

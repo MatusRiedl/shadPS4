@@ -17,6 +17,7 @@
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
+#include "common/process_exit.h"
 #include "core/debugger.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
@@ -50,6 +51,8 @@ static void StartProfileWriter() {
 #endif
 
 int main(int argc, char* argv[]) {
+    // First: its exit handlers run last (DLSS frame generation ends the process from there).
+    Common::InstallExitTerminator();
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif

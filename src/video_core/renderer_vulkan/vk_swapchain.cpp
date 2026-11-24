@@ -8,6 +8,7 @@
 #include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/host_passes/frame_gen.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
@@ -51,6 +52,9 @@ void Swapchain::Create(u32 width_, u32 height_) {
     const vk::SharingMode sharing_mode =
         exclusive ? vk::SharingMode::eExclusive : vk::SharingMode::eConcurrent;
     const auto format = needs_hdr ? SURFACE_FORMAT_HDR : surface_format;
+    // DLSS frame generation does not run with FIFO: mailbox or immediate while it is on.
+    const auto mode = HostPasses::FrameGen::AdjustPresentMode(present_mode, mailbox_available,
+                                                              immediate_available);
     const vk::SwapchainCreateInfoKHR swapchain_info = {
         .surface = surface,
         .minImageCount = image_count,
@@ -65,7 +69,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
         .pQueueFamilyIndices = queue_family_indices.data(),
         .preTransform = transform,
         .compositeAlpha = composite_alpha,
-        .presentMode = present_mode,
+        .presentMode = mode,
         .clipped = true,
         .oldSwapchain = nullptr,
     };
@@ -82,7 +86,14 @@ void Swapchain::Create(u32 width_, u32 height_) {
 void Swapchain::Recreate(u32 width_, u32 height_) {
     LOG_DEBUG(Render_Vulkan, "Recreate the swapchain: width={} height={} HDR={}", width_, height_,
               needs_hdr);
+    HostPasses::FrameGen::BeforeOutsideRecreate();
     Create(width_, height_);
+}
+
+void Swapchain::RecreateForFrameGen() {
+    LOG_INFO(Render_Vulkan, "Recreate the swapchain for frame generation: width={} height={}",
+             width, height);
+    Create(width, height);
 }
 
 void Swapchain::SetHDR(bool hdr) {
@@ -197,6 +208,8 @@ void Swapchain::FindPresentMode() {
         present_mode = vk::PresentModeKHR::eFifo;
         return;
     }
+    mailbox_available = std::ranges::find(modes, vk::PresentModeKHR::eMailbox) != modes.cend();
+    immediate_available = std::ranges::find(modes, vk::PresentModeKHR::eImmediate) != modes.cend();
 
     const auto requested_mode = EmulatorSettings.GetPresentMode();
     if (requested_mode == "Mailbox") {

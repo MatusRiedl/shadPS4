@@ -36,6 +36,8 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
+    // DLSS frame generation: the index this frame's depth and motion were tagged with, 0 if none.
+    u64 fg_index{};
 
     ImTextureID imgui_texture;
 };
